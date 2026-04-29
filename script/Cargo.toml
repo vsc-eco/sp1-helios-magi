@@ -1,0 +1,28 @@
+[package]
+version = "0.1.0"
+name = "magi-zk-oracle-script"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "vkey"
+path = "./bin/vkey.rs"
+
+[dependencies]
+sp1-sdk = { workspace = true }
+tokio = { workspace = true }
+helios-consensus-core = { workspace = true }
+helios-ethereum = { workspace = true }
+magi-zk-oracle-primitives = { workspace = true }
+serde = { workspace = true }
+serde_cbor = { workspace = true }
+alloy-primitives = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+tree_hash = { workspace = true }
+serde_json = { workspace = true }
+tracing.workspace = true
+
+[build-dependencies]
+sp1-build = { workspace = true }
