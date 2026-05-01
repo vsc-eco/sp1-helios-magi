@@ -4473,6 +4473,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
+ "clap",
  "helios-consensus-core",
  "helios-ethereum",
  "magi-zk-oracle-primitives",
