@@ -82,12 +82,23 @@ impl MagiZkProver {
         let mut stdin = SP1Stdin::new();
         stdin.write_slice(&encoded);
 
-        let proof = self
+        let mut prove_stdin = SP1Stdin::new();
+        prove_stdin.write_slice(&encoded);
+
+        let (public_values, _) = self
             .client
-            .prove(&self.lightclient_pk, stdin)
+            .execute(LIGHTCLIENT_ELF, stdin)
+            .await
+            .context("Execution failed")?;
+
+        let mut proof = self
+            .client
+            .prove(&self.lightclient_pk, prove_stdin)
             .groth16()
             .await
             .context("Groth16 proving failed")?;
+
+        proof.public_values = public_values;
 
         info!("Proof generated for slot {latest_block}");
         Ok(Some(proof))
