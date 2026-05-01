@@ -172,7 +172,9 @@ pub async fn submit_proof(
     // For now: delegate to Go sidecar for CBOR+EIP712 signing
     let tx_result = call_go_sidecar(config, "submitProof", &payload_json).await?;
 
-    let graphql_url = config.graphql_urls.first()
+    let graphql_url = config
+        .graphql_urls
+        .first()
         .ok_or_else(|| anyhow::anyhow!("No GraphQL URL configured"))?;
 
     submit_transaction(graphql_url, &tx_result.tx_b64, &tx_result.sig_b64).await
@@ -195,7 +197,9 @@ async fn call_go_sidecar(
     action: &str,
     payload_json: &str,
 ) -> Result<SignedTx> {
-    let graphql_url = config.graphql_urls.first()
+    let graphql_url = config
+        .graphql_urls
+        .first()
         .ok_or_else(|| anyhow::anyhow!("No GraphQL URL configured"))?;
 
     let nonce = fetch_nonce(graphql_url, &config.did).await?;

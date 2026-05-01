@@ -8,8 +8,8 @@ use helios_ethereum::rpc::ConsensusRpc;
 use magi_zk_oracle_primitives::types::ProofInputs;
 use sp1_sdk::env::{EnvProver, EnvProvingKey};
 use sp1_sdk::{
-    HashableKey, ProveRequest, Prover, ProverClient, SP1ProofWithPublicValues, SP1Stdin,
-    include_elf, prover::ProvingKey,
+    include_elf, prover::ProvingKey, HashableKey, ProveRequest, Prover, ProverClient,
+    SP1ProofWithPublicValues, SP1Stdin,
 };
 use std::sync::Arc;
 use tracing::info;
@@ -99,6 +99,14 @@ impl MagiZkProver {
             .context("Groth16 proving failed")?;
 
         proof.public_values = public_values;
+
+        // Verify locally before publishing. Catches any divergence between the
+        // emulator's public values (run 1) and what the prover bound into the
+        // SNARK (run 2) — the on-chain verifier would otherwise reject silently
+        // after a long round-trip.
+        self.client
+            .verify(&proof, self.lightclient_pk.verifying_key(), None)
+            .context("Local proof verification failed after public values splice")?;
 
         info!("Proof generated for slot {latest_block}");
         Ok(Some(proof))

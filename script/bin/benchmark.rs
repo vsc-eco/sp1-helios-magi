@@ -1,10 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
-use magi_zk_oracle_script::{operator::MagiZkProver, get_client};
+use magi_zk_oracle_script::{get_client, operator::MagiZkProver};
 use std::time::Instant;
 #[derive(Parser)]
 struct Args {
-    #[arg(long, default_value = "https://ethereum-sepolia-beacon-api.publicnode.com")]
+    #[arg(
+        long,
+        default_value = "https://ethereum-sepolia-beacon-api.publicnode.com"
+    )]
     consensus_rpc: String,
     #[arg(long, default_value = "11155111")]
     chain_id: u64,
@@ -24,9 +27,16 @@ async fn main() -> Result<()> {
     let t = Instant::now();
     let proof = prover.prove_header_update(&client, 0).await?;
     if let Some(p) = proof {
-        eprintln!("TIME: {:.1}s PROOF: {}B PV: {}B", t.elapsed().as_secs_f64(), p.bytes().len(), p.public_values.as_slice().len());
+        eprintln!(
+            "TIME: {:.1}s PROOF: {}B PV: {}B",
+            t.elapsed().as_secs_f64(),
+            p.bytes().len(),
+            p.public_values.as_slice().len()
+        );
         std::fs::write("/tmp/proof.bin", p.bytes())?;
         std::fs::write("/tmp/public_values.bin", p.public_values.as_slice())?;
-    } else { eprintln!("No proof generated"); }
+    } else {
+        eprintln!("No proof generated");
+    }
     Ok(())
 }
