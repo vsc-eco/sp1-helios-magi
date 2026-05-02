@@ -1,0 +1,65 @@
+name: ELF reproducibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'program/**'
+      - 'primitives/**'
+      - 'elf/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'script/build.rs'
+      - 'script/rust-toolchain'
+      - '.github/workflows/elf-reproducibility.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.91.0'
+          components: llvm-tools, rustc-dev
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-elf-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-elf-
+
+      - name: Cache SP1 build Docker image
+        uses: ScribeMD/docker-cache@0.5.0
+        with:
+          key: sp1-build-v6.1.0
+
+      # Triggers script/build.rs, which invokes the SP1 build inside the
+      # ghcr.io/succinctlabs/sp1:v6.1.0 container and writes ELFs to elf/.
+      # cargo check is enough — we only need build.rs to run, not the host link.
+      - name: Rebuild ELFs reproducibly via Docker
+        run: cargo check -p magi-zk-oracle-script
+
+      - name: Verify committed ELFs match Docker output
+        run: |
+          if ! git diff --exit-code elf/; then
+            echo "::error::Committed ELFs do not match the reproducible Docker build."
+            echo "::error::This usually means someone committed a non-Docker local build."
+            echo "::error::To fix: rebuild with docker enabled in script/build.rs and commit the result."
+            echo ""
+            echo "Affected files:"
+            git diff --name-only elf/
+            exit 1
+          fi
+          echo "ELFs match Docker output. Reproducibility verified."
