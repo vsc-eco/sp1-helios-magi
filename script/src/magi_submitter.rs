@@ -204,6 +204,9 @@ async fn call_go_sidecar(
 
     let nonce = fetch_nonce(graphql_url, &config.did).await?;
 
+    // review2 #122: pass the signing key via env, not argv. Process
+    // arguments are world-readable (/proc/<pid>/cmdline, `ps`), so a
+    // positional CLI key leaks the secp256k1 key to any local process.
     let output = tokio::process::Command::new("zk-tx-signer")
         .args([
             &config.contract_id,
@@ -212,8 +215,8 @@ async fn call_go_sidecar(
             &config.net_id,
             &config.rc_limit.to_string(),
             &nonce.to_string(),
-            &config.private_key_hex,
         ])
+        .env("ZK_TX_SIGNER_PRIVKEY", &config.private_key_hex)
         .output()
         .await?;
 
