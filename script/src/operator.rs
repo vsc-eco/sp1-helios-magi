@@ -60,6 +60,22 @@ impl MagiZkProver {
         head: u64,
     ) -> Result<Option<SP1ProofWithPublicValues>> {
         let updates = get_updates(client).await;
+        // W4 Cluster B CRIT #23: on every finality-update fetch, re-verify
+        // the upstream consensus RPC is still serving the same chainId we
+        // bootstrapped against. Mid-flight RPC pivots (e.g. operator swap
+        // of `CONSENSUS_RPC` to a sepolia node) would otherwise produce
+        // valid finality updates against the WRONG chain and the prover
+        // would happily commit them with the configured chain_id —
+        // silently siloed because the consensus RPC has no chainId, but
+        // its `chain.chain_id` config field is read at client setup and
+        // baked into `client.config.chain.chain_id`. Compare here.
+        if client.config.chain.chain_id != self.chain_id {
+            anyhow::bail!(
+                "CRIT #23: consensus client chain_id ({}) does not match prover's expected chain_id ({}) — refusing to fetch finality update against wrong chain",
+                client.config.chain.chain_id,
+                self.chain_id,
+            );
+        }
         let finality_update: FinalityUpdate<MainnetConsensusSpec> =
             client.rpc.get_finality_update().await.unwrap();
 
