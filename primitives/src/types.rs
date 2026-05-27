@@ -17,6 +17,17 @@ pub struct ProofInputs {
     pub genesis_root: B256,
     pub forks: Forks,
     pub contract_storage: Vec<ContractStorage>,
+    /// W4 Cluster B CRIT #6 Site 5 + CRIT #23: L1 chainId the prover is
+    /// running against (operator-supplied at prover startup via
+    /// `Network::from_chain_id`). Committed into ProofOutputs.chainId so
+    /// the on-chain zk-header-verifier can cross-check and the
+    /// account-mapping contract can enforce per-chain binding (CRIT #6
+    /// sites 1+2 read from the stored header).
+    ///
+    /// The operator runbook P5 step pins this value at prover bootstrap;
+    /// CRIT #23 adds a runtime re-check on every `get_finality_update`
+    /// call to detect mid-flight RPC pivots.
+    pub chain_id: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -38,6 +49,15 @@ pub struct StorageSlotWithProof {
 }
 
 sol! {
+    // W4 Cluster B CRIT #6 Site 5 + W1-cluster-B-schema §1 LOCKED:
+    //   - chainId APPENDED as the LAST field (sol position 12, ABI slot 11).
+    //   - Position is LOCKED — inserting before storageSlots would shift slot 10
+    //     (the dynamic offset pointer for storageSlots) and break every Go-side
+    //     parseProvenFields-style positional decoder. Appending preserves slots
+    //     0-10 byte-for-byte; the new chainId lives at PvFieldChainId=384.
+    //   - The Go decoder reads `chainId` from pvBytes[408:416] (last 8 bytes
+    //     of the 32-byte ABI slot, big-endian uint64). See
+    //     zk-header-verifier/contract/main.go parseProvenFields.
     struct ProofOutputs {
         /// The previous beacon block header hash.
         bytes32 prevHeader;
@@ -61,6 +81,10 @@ sol! {
         bytes32 nextSyncCommitteeHash;
         /// Attested storage slots for the given block.
         StorageSlot[] storageSlots;
+        /// W4 Cluster B Site 5: the L1 chainId this proof was generated for.
+        /// Read from the helios `Forks` / `Network::from_chain_id` config at
+        /// proof construction time and committed as part of the public values.
+        uint64 chainId;
     }
 
     struct StorageProofOutputs {

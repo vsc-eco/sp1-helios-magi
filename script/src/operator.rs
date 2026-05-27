@@ -21,10 +21,17 @@ pub struct MagiZkProver {
     client: Arc<EnvProver>,
     lightclient_pk: Arc<EnvProvingKey>,
     storage_pk: Arc<EnvProvingKey>,
+    // W4 Cluster B CRIT #6 Site 5 + CRIT #23: the expected L1 chainId.
+    // Pinned at construction from the operator's config (commonly via
+    // `Network::from_chain_id` inverse). Cached so we never re-read a
+    // potentially compromised env var mid-loop; on every
+    // get_finality_update call we re-verify the upstream RPC still
+    // reports this same chainId (CRIT #23 runtime probe).
+    chain_id: u64,
 }
 
 impl MagiZkProver {
-    pub async fn new() -> Self {
+    pub async fn new(chain_id: u64) -> Self {
         let client = ProverClient::from_env().await;
 
         info!("Setting up light client proving key...");
@@ -43,6 +50,7 @@ impl MagiZkProver {
             client: Arc::new(client),
             lightclient_pk: Arc::new(lightclient_pk),
             storage_pk: Arc::new(storage_pk),
+            chain_id,
         }
     }
 
@@ -75,6 +83,10 @@ impl MagiZkProver {
             genesis_root: client.config.chain.genesis_root,
             forks: client.config.forks.clone(),
             contract_storage: vec![],
+            // W4 Cluster B Site 5: thread chainId into the ZK input so the
+            // program (light_client.rs main()) can commit it as part of
+            // ProofOutputs.
+            chain_id: self.chain_id,
         };
 
         let encoded = serde_cbor::to_vec(&inputs).context("Failed to encode proof inputs")?;
