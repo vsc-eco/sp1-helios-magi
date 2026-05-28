@@ -16,7 +16,9 @@ struct Args {
 async fn main() -> Result<()> {
     sp1_sdk::utils::setup_logger();
     let args = Args::parse();
-    let prover = MagiZkProver::new().await;
+    // Offline benchmark: never submits on-chain, so the HIGH #22 ELF pin
+    // check is intentionally skipped (None). A live prover MUST pass Some(..).
+    let prover = MagiZkProver::new(args.chain_id, None).await;
     let current_slot = {
         let c = get_client(None, &args.consensus_rpc, args.chain_id).await?;
         c.store.finalized_header.beacon().slot

@@ -11,11 +11,178 @@ use sp1_sdk::{
     include_elf, prover::ProvingKey, HashableKey, ProveRequest, Prover, ProverClient,
     SP1ProofWithPublicValues, SP1Stdin,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 const LIGHTCLIENT_ELF: sp1_sdk::Elf = include_elf!("light_client");
 const STORAGE_ELF: sp1_sdk::Elf = include_elf!("storage");
+
+// W4 Cluster B HIGH #22 — ELF hash pinning, prover-side consumer.
+//
+// The zk-header-verifier contract stores the SHA-256 of the SP1 ELF binary
+// the prover is authorized to use under state key `KeyExpectedElfHash`
+// (string literal "elfhash", see zk-header-verifier/contract/main.go). The
+// `setExpectedElfHash` admin handler writes the 64-char lowercase-or-mixed
+// hex form (0x prefix stripped) via `sdk.StateSetObject("elfhash", h)`,
+// which stores the RAW UTF-8 bytes of that hex string.
+//
+// This consumer reads that key at prover startup, recomputes the SHA-256 of
+// the LOCAL `light_client` ELF the prover actually proves against, and
+// fatal-exits on mismatch. Without it the on-chain handler is hollow: a
+// malicious operator could swap the ELF and rotate the vkey to match,
+// defeating binary authenticity. This is the missing half of HIGH #22.
+pub const KEY_EXPECTED_ELF_HASH: &str = "elfhash";
+
+/// Configuration required to read the on-chain expected-ELF-hash for the
+/// HIGH #22 startup pin. Populated from the operator's Magi config (same
+/// GraphQL endpoints + verifier contract id used by the submitter).
+#[derive(Clone)]
+pub struct ElfPinConfig {
+    /// Magi GraphQL endpoint(s), e.g. "https://api.vsc.eco/api/v1/graphql".
+    pub graphql_urls: Vec<String>,
+    /// zk-header-verifier contract id on Magi.
+    pub contract_id: String,
+}
+
+/// GraphQL response wrapper for `getStateByKeys`. We request WITHOUT the
+/// `hex` encoding so the contract value is returned as the plain UTF-8
+/// string the contract stored (the 64-char hex), avoiding any double-hex
+/// ambiguity. Unset keys come back as JSON `null`.
+#[derive(serde::Deserialize)]
+struct StateResponse {
+    data: Option<StateData>,
+    errors: Option<Vec<GqlError>>,
+}
+
+#[derive(serde::Deserialize)]
+struct StateData {
+    #[serde(rename = "getStateByKeys")]
+    state: Option<std::collections::HashMap<String, Option<String>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct GqlError {
+    message: String,
+}
+
+/// Read the on-chain expected ELF hash from the zk-header-verifier contract
+/// state via `getStateByKeys`. Returns:
+///   - `Ok(Some(hash))` when the key is set (normalized: lowercase, no 0x),
+///   - `Ok(None)` when the key is unset (grace window before first
+///     `setExpectedElfHash`),
+///   - `Err(_)` on transport/GraphQL failure (treated as fatal by the
+///     caller — we must not start unpinned because a node is unreachable).
+async fn fetch_expected_elf_hash(cfg: &ElfPinConfig) -> Result<Option<String>> {
+    let graphql_url = cfg
+        .graphql_urls
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("HIGH #22: no GraphQL URL configured for ELF-hash pin"))?;
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "query": "query($contractId: String!, $keys: [String!]!) { getStateByKeys(contractId: $contractId, keys: $keys) }",
+        "variables": {
+            "contractId": cfg.contract_id,
+            "keys": [KEY_EXPECTED_ELF_HASH],
+        }
+    });
+
+    let resp: StateResponse = client
+        .post(graphql_url)
+        .json(&body)
+        .send()
+        .await
+        .context("HIGH #22: getStateByKeys request failed")?
+        .json()
+        .await
+        .context("HIGH #22: getStateByKeys response was not valid JSON")?;
+
+    if let Some(errors) = resp.errors {
+        if let Some(first) = errors.first() {
+            anyhow::bail!("HIGH #22: getStateByKeys GraphQL error: {}", first.message);
+        }
+    }
+
+    let raw = resp
+        .data
+        .and_then(|d| d.state)
+        .and_then(|m| m.get(KEY_EXPECTED_ELF_HASH).cloned())
+        .flatten();
+
+    // Normalize: strip optional 0x prefix, lowercase. Empty string == unset.
+    let normalized = raw.and_then(|h| {
+        let trimmed = h.trim();
+        let no_prefix = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let lowered = no_prefix.to_ascii_lowercase();
+        if lowered.is_empty() {
+            None
+        } else {
+            Some(lowered)
+        }
+    });
+
+    Ok(normalized)
+}
+
+/// HIGH #22 startup consumer: compute the SHA-256 of the local light_client
+/// ELF and compare it against the on-chain pinned hash. Fatal-exits the
+/// process on mismatch. Logs a WARNING and allows startup when the on-chain
+/// hash is unset (deploy-then-pin grace window). Any failure to READ the
+/// on-chain hash is fatal — refusing to start unpinned on a transient node
+/// error is the safe default for a fund-affecting bridge.
+async fn verify_elf_hash(cfg: &ElfPinConfig) {
+    // Hash the SAME bytes the prover proves against. `LIGHTCLIENT_ELF` is the
+    // compile-time `include_elf!("light_client")` artifact; `.as_ref()`
+    // exposes its raw bytes. sp1-build (build.rs) writes that artifact to
+    // `elf/light_client`, which is exactly what the operator runbook hashes
+    // via `sha256sum elf/light_client` (scripts/inspect-elf.sh) to feed
+    // `setExpectedElfHash`. The two are byte-identical by construction.
+    let elf_bytes: &[u8] = LIGHTCLIENT_ELF.as_ref();
+    let local_hash = hex::encode(Sha256::digest(elf_bytes));
+    info!("HIGH #22: local light_client ELF sha256 = {local_hash}");
+
+    let expected = match fetch_expected_elf_hash(cfg).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Cannot read the pin -> cannot prove we are running the
+            // authorized binary. Fatal: do not start a fund-affecting prover
+            // in an unverifiable state.
+            eprintln!("FATAL HIGH #22: unable to read on-chain expected ELF hash: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
+    match expected {
+        None => {
+            // Grace window: operator has not yet run setExpectedElfHash. This
+            // is the documented deploy-then-pin sequence (W0 P5 ramp-up). Allow
+            // startup but make the unpinned state loud and auditable.
+            warn!(
+                "HIGH #22: on-chain expected ELF hash is UNSET (key '{}' on contract {}). \
+                 Prover starting UNPINNED — this is only safe during the deploy-then-pin \
+                 grace window. Operator MUST call setExpectedElfHash with {} to close it.",
+                KEY_EXPECTED_ELF_HASH, cfg.contract_id, local_hash
+            );
+        }
+        Some(on_chain) if on_chain == local_hash => {
+            info!("HIGH #22: local ELF hash matches on-chain pin — binary authenticity OK");
+        }
+        Some(on_chain) => {
+            eprintln!(
+                "FATAL HIGH #22: ELF hash mismatch. on-chain expected={on_chain} \
+                 local light_client={local_hash}. The running prover binary does NOT \
+                 match the hash pinned on contract {}. Refusing to produce proofs — \
+                 a swapped ELF + rotated vkey would otherwise forge authoritative L1 state.",
+                cfg.contract_id
+            );
+            std::process::exit(1);
+        }
+    }
+}
 
 pub struct MagiZkProver {
     client: Arc<EnvProver>,
@@ -31,7 +198,28 @@ pub struct MagiZkProver {
 }
 
 impl MagiZkProver {
-    pub async fn new(chain_id: u64) -> Self {
+    /// Construct the prover.
+    ///
+    /// `elf_pin` carries the GraphQL endpoints + verifier contract id needed
+    /// to enforce the HIGH #22 ELF-hash pin. When `Some`, the startup check
+    /// runs BEFORE any proving key setup and fatal-exits on mismatch (or on
+    /// inability to read the on-chain pin). `None` is reserved for offline
+    /// tooling (e.g. the `benchmark` bin) that never submits proofs on-chain;
+    /// the real operator MUST pass `Some(..)`.
+    pub async fn new(chain_id: u64, elf_pin: Option<ElfPinConfig>) -> Self {
+        // W4 Cluster B HIGH #22: enforce ELF-hash pin at startup, before the
+        // prover does any work. This is the consumer half of the on-chain
+        // setExpectedElfHash handler — without it that handler is hollow.
+        if let Some(cfg) = elf_pin.as_ref() {
+            verify_elf_hash(cfg).await;
+        } else {
+            warn!(
+                "HIGH #22: ELF-hash pin check SKIPPED (no ElfPinConfig provided). \
+                 This path is for offline tooling only and must NOT be used by a \
+                 prover that submits proofs on-chain."
+            );
+        }
+
         let client = ProverClient::from_env().await;
 
         info!("Setting up light client proving key...");
