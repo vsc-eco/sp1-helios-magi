@@ -106,11 +106,19 @@ pub async fn fetch_nonce(graphql_url: &str, did: &str) -> Result<u64> {
         .json()
         .await?;
 
-    Ok(resp
-        .data
+    // review6 closure (Z-PR-H2): fail loud when the GraphQL response does
+    // not contain a usable nonce. Pre-fix `.unwrap_or(0)` defaulted to
+    // nonce=0 on any parse/missing-field failure, causing the submitter
+    // to sign a tx the chain immediately rejects (or worse, collide with
+    // init). An explicit error gives the operator the right signal.
+    resp.data
         .and_then(|d| d.nonce_result)
         .map(|n| n.nonce)
-        .unwrap_or(0))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "fetch_nonce: GraphQL response missing getAccountNonce.nonce — refusing to default to 0"
+            )
+        })
 }
 
 /// Submit a signed transaction to Magi GraphQL.

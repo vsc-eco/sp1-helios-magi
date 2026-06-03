@@ -247,7 +247,7 @@ impl MagiZkProver {
         client: &Inner<MainnetConsensusSpec, HttpRpc>,
         head: u64,
     ) -> Result<Option<SP1ProofWithPublicValues>> {
-        let updates = get_updates(client).await;
+        let updates = get_updates(client).await?;
         // W4 Cluster B CRIT #23: on every finality-update fetch, re-verify
         // the upstream consensus RPC is still serving the same chainId we
         // bootstrapped against. Mid-flight RPC pivots (e.g. operator swap
