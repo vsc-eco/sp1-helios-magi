@@ -204,7 +204,15 @@ async fn call_go_sidecar(
 
     let nonce = fetch_nonce(graphql_url, &config.did).await?;
 
+    // review6 H4: pass the private key via env var instead of CLI argv.
+    // argv is world-readable via /proc/<pid>/cmdline and `ps aux`, exposing
+    // the operator key to any user/process on the box for the lifetime of
+    // the subprocess. Env vars are visible only to the parent's UID via
+    // /proc/<pid>/environ (mode 0400). zk-tx-signer already supports the
+    // ZK_TX_SIGNER_PRIVKEY env-var path via the review2 #122 fix; this
+    // closes the caller side that still pinned the legacy argv form.
     let output = tokio::process::Command::new("zk-tx-signer")
+        .env("ZK_TX_SIGNER_PRIVKEY", &config.private_key_hex)
         .args([
             &config.contract_id,
             action,
@@ -212,7 +220,8 @@ async fn call_go_sidecar(
             &config.net_id,
             &config.rc_limit.to_string(),
             &nonce.to_string(),
-            &config.private_key_hex,
+            // private key intentionally NOT on argv — read from
+            // ZK_TX_SIGNER_PRIVKEY in the signer.
         ])
         .output()
         .await?;
