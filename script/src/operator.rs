@@ -281,8 +281,14 @@ impl MagiZkProver {
                 self.chain_id,
             );
         }
-        let finality_update: FinalityUpdate<MainnetConsensusSpec> =
-            client.rpc.get_finality_update().await.unwrap();
+        // CC-2 (MED round-4): propagate RPC failure via Result instead of
+        // panicking. A transient consensus-RPC hiccup previously killed the
+        // entire prover task; the caller can now retry at its own cadence.
+        let finality_update: FinalityUpdate<MainnetConsensusSpec> = client
+            .rpc
+            .get_finality_update()
+            .await
+            .map_err(|e| anyhow::anyhow!("get_finality_update failed: {e}"))?;
 
         let latest_block = finality_update.finalized_header().beacon().slot;
         if latest_block <= head {
