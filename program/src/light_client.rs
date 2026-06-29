@@ -78,9 +78,18 @@ pub fn main() {
     // 3. Commit new state root, header, and sync committee.
     let header: B256 = store.finalized_header.beacon().tree_hash_root();
     let sync_committee_hash: B256 = store.current_sync_committee.tree_hash_root();
+    // MED Z-PR-M1 (Nomad-pattern landmine): when there is no next sync
+    // committee yet, do NOT emit B256::ZERO. A downstream consumer that compares
+    // this committed field against its own uninitialized (zero) storage would
+    // treat `ZERO == ZERO` as a valid match and silently bypass the sync-committee
+    // rotation guard. Emit an unambiguous non-zero sentinel instead: all-ones can
+    // never collide with zero-initialized storage, and the probability that a real
+    // SSZ `tree_hash_root` equals 0xFF..FF is cryptographically negligible, so a
+    // consumer can reliably distinguish "no next committee" from any real hash.
+    const NO_NEXT_SYNC_COMMITTEE: B256 = B256::repeat_byte(0xFF);
     let next_sync_committee_hash: B256 = match &mut store.next_sync_committee {
         Some(next_sync_committee) => next_sync_committee.tree_hash_root(),
-        None => B256::ZERO,
+        None => NO_NEXT_SYNC_COMMITTEE,
     };
     let head = store.finalized_header.beacon().slot;
     let execution = store

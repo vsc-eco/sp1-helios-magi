@@ -13,6 +13,29 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Z-PR-M4 (MED #41): bound every GraphQL HTTP call made by this module.
+///
+/// `reqwest::Client::new()` builds a client with NO overall request timeout
+/// and NO connect timeout. A slow or hung Magi GraphQL endpoint would
+/// otherwise pin the calling tokio task forever (a slow-loris upstream
+/// stalls the whole proof-submission pipeline). Both a connect timeout and
+/// an overall request timeout are required: connect-only does not bound a
+/// peer that completes the TCP handshake then trickles bytes.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a reqwest client with bounded connect + overall request timeouts.
+/// Used for all Magi GraphQL calls in this module so no single hung endpoint
+/// can stall the submitter indefinitely.
+fn magi_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
+}
 
 /// Configuration for the Magi submitter.
 #[derive(Clone)]
@@ -92,7 +115,7 @@ struct NonceResult {
 
 /// Fetch the account nonce from Magi GraphQL.
 pub async fn fetch_nonce(graphql_url: &str, did: &str) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = magi_http_client()?;
     let body = serde_json::json!({
         "query": "query($account: String!) { getAccountNonce(account: $account) { nonce } }",
         "variables": { "account": did }
@@ -123,7 +146,7 @@ pub async fn fetch_nonce(graphql_url: &str, did: &str) -> Result<u64> {
 
 /// Submit a signed transaction to Magi GraphQL.
 pub async fn submit_transaction(graphql_url: &str, tx_b64: &str, sig_b64: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = magi_http_client()?;
     let body = serde_json::json!({
         "query": "query($tx: String!, $sig: String!) { submitTransactionV1(tx: $tx, sig: $sig) { id } }",
         "variables": { "tx": tx_b64, "sig": sig_b64 }
@@ -150,6 +173,16 @@ pub async fn submit_transaction(graphql_url: &str, tx_b64: &str, sig_b64: &str) 
 }
 
 /// Build and submit a proof to the Magi verifier contract.
+///
+/// Z-PR-M5 (MED #42): this path is NOT a pure-Rust submitter. The CBOR +
+/// EIP-712 signing is delegated to the external `zk-tx-signer` Go binary
+/// (go-vsc-node/cmd/zk-tx-signer), invoked by `call_go_sidecar`. That binary
+/// MUST be present on PATH and the operator key is handed to it via the
+/// `ZK_TX_SIGNER_PRIVKEY` env var (NOT argv — review6 H4 / sidecar review2
+/// #122). Do NOT hand-roll a replacement signer: a bespoke shim that passes
+/// the key on the command line would re-open the Z-PR-H1 argv key-leak. The
+/// in-process Rust port of the signing path (steps 1-4 below) is the eventual
+/// goal; until it lands, this entry point depends on that external sidecar.
 ///
 /// NOTE: This is a PLACEHOLDER. The full implementation requires:
 /// 1. CBOR encoding of VscContractCall (matching Go's SerializeVSC)
@@ -240,8 +273,28 @@ async fn call_go_sidecar(
     }
 
     let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(SignedTx {
-        tx_b64: result["tx_b64"].as_str().unwrap_or("").to_string(),
-        sig_b64: result["sig_b64"].as_str().unwrap_or("").to_string(),
-    })
+
+    // Z-PR-M5 (MED #42): fail loud when the sidecar response is missing or
+    // empty. The pre-fix `.unwrap_or("")` silently substituted an empty
+    // string for an absent/empty `tx_b64`/`sig_b64`, which would then be
+    // submitted to `submitTransactionV1` as a malformed transaction — a
+    // skeleton-path footgun that wastes a proof and produces a confusing
+    // chain-side rejection instead of a clear operator-facing error. Demand
+    // both fields be present and non-empty.
+    let tx_b64 = result["tx_b64"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("zk-tx-signer returned no/empty tx_b64 — refusing to submit an empty transaction")
+        })?
+        .to_string();
+    let sig_b64 = result["sig_b64"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("zk-tx-signer returned no/empty sig_b64 — refusing to submit an unsigned transaction")
+        })?
+        .to_string();
+
+    Ok(SignedTx { tx_b64, sig_b64 })
 }

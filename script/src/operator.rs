@@ -13,7 +13,20 @@ use sp1_sdk::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// Z-PR-M4 (MED #41): bound the ELF-pin GraphQL call.
+///
+/// `reqwest::Client::new()` builds a client with NO overall request timeout
+/// and NO connect timeout, so a hung Magi GraphQL endpoint can pin the
+/// startup ELF-pin check forever. Because a read failure here is FATAL
+/// (the prover refuses to start unpinned), an unbounded hang would deadlock
+/// startup rather than fail loud. Both a connect timeout and an overall
+/// request timeout are required: connect-only does not bound a peer that
+/// completes the handshake then trickles bytes.
+const ELF_PIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ELF_PIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const LIGHTCLIENT_ELF: sp1_sdk::Elf = include_elf!("light_client");
 const STORAGE_ELF: sp1_sdk::Elf = include_elf!("storage");
@@ -79,7 +92,11 @@ async fn fetch_expected_elf_hash(cfg: &ElfPinConfig) -> Result<Option<String>> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("HIGH #22: no GraphQL URL configured for ELF-hash pin"))?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(ELF_PIN_CONNECT_TIMEOUT)
+        .timeout(ELF_PIN_REQUEST_TIMEOUT)
+        .build()
+        .context("HIGH #22: failed to build HTTP client for ELF-hash pin")?;
     let body = serde_json::json!({
         "query": "query($contractId: String!, $keys: [String!]!) { getStateByKeys(contractId: $contractId, keys: $keys) }",
         "variables": {
