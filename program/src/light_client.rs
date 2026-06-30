@@ -32,9 +32,6 @@ pub fn main() {
         genesis_root,
         forks,
         contract_storage,
-        // W4 Cluster B CRIT #6 Site 5: chainId committed alongside the
-        // ZK proof public values.
-        chain_id,
     } = serde_cbor::from_slice(&encoded_inputs).unwrap();
 
     // Get the initial sync committee hash. When verifying the proof, this is secured by the
@@ -116,14 +113,12 @@ pub fn main() {
         prevHead: U256::from(prev_head),
         syncCommitteeHash: sync_committee_hash,
         prevSyncCommitteeHash: prev_sync_committee_hash,
+        // Chain identity: the same genesis_validators_root used above in
+        // verify_update / verify_finality_update for the BLS signing domain,
+        // committed so the on-chain verifier can pin + check it (ABI slot 10,
+        // pvBytes[352:384]).
+        genesisRoot: genesis_root,
         storageSlots: storage_slots,
-        // W4 Cluster B Site 5 LOCKED: chainId is the LAST field in the
-        // sol struct (ABI slot 11). It is taken verbatim from
-        // ProofInputs.chain_id; the operator's offchain prover supplies
-        // the canonical value at proof construction time (Network::from_chain_id
-        // in script/src/lib.rs). The Go zk-header-verifier decoder reads
-        // this at pvBytes[408:416].
-        chainId: chain_id,
     };
 
     sp1_zkvm::io::commit_slice(&proof_outputs.abi_encode());

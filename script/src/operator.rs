@@ -310,10 +310,6 @@ impl MagiZkProver {
             genesis_root: client.config.chain.genesis_root,
             forks: client.config.forks.clone(),
             contract_storage: vec![],
-            // W4 Cluster B Site 5: thread chainId into the ZK input so the
-            // program (light_client.rs main()) can commit it as part of
-            // ProofOutputs.
-            chain_id: self.chain_id,
         };
 
         let encoded = serde_cbor::to_vec(&inputs).context("Failed to encode proof inputs")?;
