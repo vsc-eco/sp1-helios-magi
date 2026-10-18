@@ -34,6 +34,19 @@ pub fn main() {
         contract_storage,
     } = serde_cbor::from_slice(&encoded_inputs).unwrap();
 
+    // RV-4 (RV re-verify): port upstream sp1-helios #54. The `store` is a
+    // prover-supplied input, so a prover can pre-populate store.next_sync_committee
+    // with an arbitrary committee. If no verified update rotates it during this
+    // proof, that un-verified committee would be committed as nextSyncCommitteeHash
+    // below and the on-chain verifier would start trusting it — the committee can
+    // then forge finality on a later proof (unbacked mint). Reset it to None so a
+    // next committee can ONLY come from a verify_update that carries (and proves)
+    // one in THIS proof. REQUIRES an ELF rebuild + a new vkey + the 14-day vkey
+    // timelock before it takes effect on-chain (operator/Milo). The on-chain
+    // verifier's set-if-empty committee write + prevHead binding (zk-header-verifier
+    // RV-4) independently blocks the same attack at the consumer side.
+    store.next_sync_committee = None;
+
     // Get the initial sync committee hash. When verifying the proof, this is secured by the
     // `prevSyncCommitteeHash` field in the `ProofOutputs` struct.
     let prev_sync_committee_hash = store.current_sync_committee.tree_hash_root();
