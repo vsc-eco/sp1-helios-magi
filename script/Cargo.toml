@@ -30,6 +30,7 @@ serde = { workspace = true }
 serde_cbor = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true }
+alloy-rlp = { workspace = true }
 alloy-trie = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
@@ -51,3 +52,7 @@ sp1-build = { workspace = true }
 [[bin]]
 name = "benchmark"
 path = "bin/benchmark.rs"
+
+[[bin]]
+name = "magi_operator"
+path = "bin/magi_operator.rs"

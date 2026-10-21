@@ -15,6 +15,7 @@ use tokio::sync::{mpsc::channel, watch};
 
 pub mod execution;
 pub mod handle;
+pub mod magi_operator;
 pub mod magi_prover;
 pub mod magi_submitter;
 pub mod operator;

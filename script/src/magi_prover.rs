@@ -96,22 +96,27 @@ struct GqlError {
 ///     `setExpectedElfHash`),
 ///   - `Err(_)` on transport/GraphQL failure (treated as fatal by the
 ///     caller — we must not start unpinned because a node is unreachable).
-async fn fetch_expected_elf_hash(cfg: &ElfPinConfig) -> Result<Option<String>> {
-    let graphql_url = cfg
-        .graphql_urls
+/// Reads `keys` from a contract's state over Magi GraphQL (`getStateByKeys`).
+/// A key Magi does not hold maps to `None` or `Some("")`.
+pub async fn fetch_contract_state(
+    graphql_urls: &[String],
+    contract_id: &str,
+    keys: &[&str],
+) -> Result<HashMap<String, Option<String>>> {
+    let graphql_url = graphql_urls
         .first()
-        .ok_or_else(|| anyhow::anyhow!("HIGH #22: no GraphQL URL configured for ELF-hash pin"))?;
+        .ok_or_else(|| anyhow::anyhow!("no GraphQL URL configured"))?;
 
     let client = reqwest::Client::builder()
         .connect_timeout(ELF_PIN_CONNECT_TIMEOUT)
         .timeout(ELF_PIN_REQUEST_TIMEOUT)
         .build()
-        .context("HIGH #22: failed to build HTTP client for ELF-hash pin")?;
+        .context("failed to build HTTP client for getStateByKeys")?;
     let body = serde_json::json!({
         "query": "query($contractId: String!, $keys: [String!]!) { getStateByKeys(contractId: $contractId, keys: $keys) }",
         "variables": {
-            "contractId": cfg.contract_id,
-            "keys": [KEY_EXPECTED_ELF_HASH],
+            "contractId": contract_id,
+            "keys": keys,
         }
     });
 
@@ -120,24 +125,26 @@ async fn fetch_expected_elf_hash(cfg: &ElfPinConfig) -> Result<Option<String>> {
         .json(&body)
         .send()
         .await
-        .context("HIGH #22: getStateByKeys request failed")?
+        .context("getStateByKeys request failed")?
         .json()
         .await
-        .context("HIGH #22: getStateByKeys response was not valid JSON")?;
+        .context("getStateByKeys response was not valid JSON")?;
 
     if let Some(errors) = resp.errors {
         if let Some(first) = errors.first() {
-            anyhow::bail!("HIGH #22: getStateByKeys GraphQL error: {}", first.message);
+            anyhow::bail!("getStateByKeys GraphQL error: {}", first.message);
         }
     }
 
-    let raw = resp
-        .data
-        .and_then(|d| d.state)
-        .and_then(|m| m.get(KEY_EXPECTED_ELF_HASH).cloned())
-        .flatten();
+    Ok(resp.data.and_then(|d| d.state).unwrap_or_default())
+}
 
-    // Normalize: strip optional 0x prefix, lowercase. Empty string == unset.
+async fn fetch_expected_elf_hash(cfg: &ElfPinConfig) -> Result<Option<String>> {
+    let state = fetch_contract_state(&cfg.graphql_urls, &cfg.contract_id, &[KEY_EXPECTED_ELF_HASH])
+        .await
+        .context("HIGH #22: reading the ELF-hash pin")?;
+    let raw = state.get(KEY_EXPECTED_ELF_HASH).cloned().flatten();
+
     let normalized = raw.and_then(|h| {
         let trimmed = h.trim();
         let no_prefix = trimmed
