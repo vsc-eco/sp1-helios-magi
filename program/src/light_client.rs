@@ -96,9 +96,18 @@ pub fn main() {
     // 3. Commit new state root, header, and sync committee.
     let header: B256 = store.finalized_header.beacon().tree_hash_root();
     let sync_committee_hash: B256 = store.current_sync_committee.tree_hash_root();
+    // MED Z-PR-M1 (Nomad-pattern landmine): when there is no next sync
+    // committee yet, do NOT emit B256::ZERO. A downstream consumer that compares
+    // this committed field against its own uninitialized (zero) storage would
+    // treat `ZERO == ZERO` as a valid match and silently bypass the sync-committee
+    // rotation guard. Emit an unambiguous non-zero sentinel instead: all-ones can
+    // never collide with zero-initialized storage, and the probability that a real
+    // SSZ `tree_hash_root` equals 0xFF..FF is cryptographically negligible, so a
+    // consumer can reliably distinguish "no next committee" from any real hash.
+    const NO_NEXT_SYNC_COMMITTEE: B256 = B256::repeat_byte(0xFF);
     let next_sync_committee_hash: B256 = match &mut store.next_sync_committee {
         Some(next_sync_committee) => next_sync_committee.tree_hash_root(),
-        None => B256::ZERO,
+        None => NO_NEXT_SYNC_COMMITTEE,
     };
     let head = store.finalized_header.beacon().slot;
     let execution = verified_execution_fields(&store.finalized_header, execution_header.as_ref())
@@ -114,6 +123,7 @@ pub fn main() {
 
     let proof_outputs = ProofOutputs {
         executionStateRoot: execution.state_root,
+        executionBlockHash: execution.block_hash,
         newHeader: header,
         executionBlockNumber: U256::from(execution.block_number),
         nextSyncCommitteeHash: next_sync_committee_hash,
@@ -122,6 +132,11 @@ pub fn main() {
         prevHead: U256::from(prev_head),
         syncCommitteeHash: sync_committee_hash,
         prevSyncCommitteeHash: prev_sync_committee_hash,
+        // Chain identity: the same genesis_validators_root used above in
+        // verify_update / verify_finality_update for the BLS signing domain,
+        // committed so the on-chain verifier can pin + check it (ABI slot 10,
+        // pvBytes[352:384]).
+        genesisRoot: genesis_root,
         storageSlots: storage_slots,
     };
 

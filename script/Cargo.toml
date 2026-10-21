@@ -6,14 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "genesis"
-path = "./bin/genesis.rs"
-
-[[bin]]
-name = "operator"
-path = "./bin/operator.rs"
-
-[[bin]]
 name = "vkey"
 path = "./bin/vkey.rs"
 
@@ -29,7 +21,6 @@ path = "./bin/validate_fixture.rs"
 cuda = ["sp1-sdk/cuda"]
 
 [dependencies]
-dotenv = { workspace = true }
 sp1-sdk = { workspace = true }
 tokio = { workspace = true }
 helios-consensus-core = { workspace = true }
@@ -37,19 +28,26 @@ helios-ethereum = { workspace = true }
 sp1-helios-primitives = { workspace = true }
 serde = { workspace = true }
 serde_cbor = { workspace = true }
-clap = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true }
 alloy-trie = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
 cargo_metadata = { workspace = true }
+dotenv = { workspace = true }
+futures = "0.3.31"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 reqwest = { workspace = true }
 tree_hash = { workspace = true }
 serde_json = { workspace = true }
-futures = "0.3.31"
 tracing.workspace = true
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 sp1-build = { workspace = true }
+
+[[bin]]
+name = "benchmark"
+path = "bin/benchmark.rs"

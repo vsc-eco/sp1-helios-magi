@@ -56,7 +56,9 @@ async fn execute_execution_header(cbor_inputs: &[u8]) -> ExecutionHeaderProofOut
 /// `store.next_sync_committee` (here a clone of the trusted current committee, standing in for
 /// any attacker-chosen committee). The honest current committee still verifies the finality
 /// update, so the program runs to completion — but the fix drops the poisoned next committee, so
-/// the committed `nextSyncCommitteeHash` must be `B256::ZERO`.
+/// the committed `nextSyncCommitteeHash` must be the "no next committee" value: Magi's light
+/// client commits 0xFF..FF there (MED Z-PR-M1: never ZERO, which would match an uninitialized
+/// slot), the execution-header program (upstream, unchanged) commits `B256::ZERO`.
 ///
 /// Without the fix this would commit `tree_hash_root()` of the poisoned committee instead.
 #[tokio::test]
@@ -85,10 +87,13 @@ async fn next_sync_committee_poisoning_is_dropped() {
     );
     assert_eq!(
         outputs.nextSyncCommitteeHash,
-        B256::ZERO,
+        NO_NEXT_SYNC_COMMITTEE,
         "poisoned next_sync_committee leaked into the committed output; the fix is not in effect"
     );
 }
+
+/// Magi's light client commits "no next committee" as 0xFF..FF (program/src/light_client.rs).
+const NO_NEXT_SYNC_COMMITTEE: B256 = B256::repeat_byte(0xFF);
 
 /// POSITIVE / liveness: the unmodified fixture's `updates` legitimately populate
 /// `next_sync_committee` via `verify_update`/`apply_update`, so the committed hash must be
@@ -124,6 +129,17 @@ async fn verified_next_sync_committee_is_committed() {
     assert_eq!(
         outputs.nextSyncCommitteeHash, expected,
         "committed next_sync_committee hash does not match the verified update's committee"
+    );
+    // Magi outputs: chain identity and the execution block the verifier keccak-checks the
+    // submitted RLP header against.
+    assert_eq!(
+        outputs.genesisRoot, inputs.genesis_root,
+        "committed genesisRoot is not the genesis_validators_root the updates were verified with"
+    );
+    assert_ne!(
+        outputs.executionBlockHash,
+        B256::ZERO,
+        "light client did not commit the finalized execution block hash"
     );
 }
 

@@ -15,11 +15,18 @@ use tokio::sync::{mpsc::channel, watch};
 
 pub mod execution;
 pub mod handle;
+pub mod magi_prover;
+pub mod magi_submitter;
 pub mod operator;
 
 pub const MAX_REQUEST_LIGHT_CLIENT_UPDATES: u8 = 128;
 
-/// Fetch updates for client
+/// Fetch updates for client.
+///
+/// review6 closure (Z-PR-H3): propagate the RPC error via Result instead
+/// of `.unwrap()`-panicking. The prior panic killed the entire submitter
+/// process on any transient consensus-RPC hiccup. Callers can now retry
+/// at their own cadence.
 pub async fn get_updates(
     client: &Inner<MainnetConsensusSpec, HttpRpc>,
 ) -> Result<Vec<Update<MainnetConsensusSpec>>> {
@@ -55,9 +62,12 @@ pub async fn get_latest_checkpoint(chain_id: u64) -> Result<B256> {
         .await
         .map_err(|e| anyhow!("error building checkpoint fallback: {}", e.to_string()))?;
 
-    let network = Network::from_chain_id(chain_id).unwrap_or_else(|_| {
-        panic!("unknown network: {chain_id}");
-    });
+    // review6 closure (Z-PR-L4): convert the panic on unknown chain_id
+    // into a typed error so a misconfigured submitter doesn't crash —
+    // instead it returns a clear "unknown network" error the operator
+    // can map to a config fix.
+    let network = Network::from_chain_id(chain_id)
+        .map_err(|_| anyhow!("get_latest_checkpoint: unknown network chain_id={}", chain_id))?;
 
     cf.fetch_latest_checkpoint(&network)
         .await
@@ -72,7 +82,10 @@ pub async fn get_client(
     consensus_rpc: &str,
     chain_id: u64,
 ) -> Result<Inner<MainnetConsensusSpec, HttpRpc>> {
-    let network = Network::from_chain_id(chain_id).unwrap();
+    // review6 closure (Z-PR-H3): convert `.unwrap()` panic into a typed
+    // error. Same rationale as get_latest_checkpoint above.
+    let network = Network::from_chain_id(chain_id)
+        .map_err(|_| anyhow!("get_client: unknown network chain_id={}", chain_id))?;
     let base_config = network.to_base_config();
 
     let config = Config {

@@ -41,6 +41,15 @@ pub struct StorageSlotWithProof {
 }
 
 sol! {
+    // Chain-binding (genesis + sync-committee anchoring) — see the
+    // zk-header-verifier plan. `genesisRoot` is the genesis_validators_root the
+    // sync-committee signatures were verified against in-circuit, committed here
+    // so the on-chain verifier can pin + check it. It sits at sol position 11
+    // (ABI slot 10, byte 352); `storageSlots` (dynamic) follows at slot 11.
+    // The Go decoder reads `genesisRoot` from pvBytes[352:384]. The earlier
+    // `chainId` field (slot 11) was REMOVED — chain identity is established by
+    // genesisRoot + the trusted sync committee, not a spoofable committed scalar;
+    // the verifier stamps its own configured chainId into stored headers.
     struct ProofOutputs {
         /// The previous beacon block header hash.
         bytes32 prevHeader;
@@ -54,12 +63,17 @@ sol! {
         bytes32 newHeader;
         /// The execution state root from the execution payload of the new beacon block.
         bytes32 executionStateRoot;
+        /// The execution block hash from the execution payload of the new beacon block.
+        bytes32 executionBlockHash;
         /// The execution block number.
         uint256 executionBlockNumber;
         /// The sync committee hash of the current period.
         bytes32 syncCommitteeHash;
         /// The sync committee hash of the next period.
         bytes32 nextSyncCommitteeHash;
+        /// The genesis_validators_root the sync-committee signatures were
+        /// verified against (chain identity). Pinned + checked on-chain.
+        bytes32 genesisRoot;
         /// Attested storage slots for the given block.
         StorageSlot[] storageSlots;
     }
