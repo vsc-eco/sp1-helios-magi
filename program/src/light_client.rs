@@ -6,7 +6,8 @@ use alloy_sol_types::SolValue;
 use helios_consensus_core::{
     apply_finality_update, apply_update, verify_finality_update, verify_update,
 };
-use magi_zk_oracle_primitives::{
+use sp1_helios_primitives::{
+    execution::verified_execution_fields,
     types::{ProofInputs, ProofOutputs},
     verify_storage_slot_proofs,
 };
@@ -32,7 +33,27 @@ pub fn main() {
         genesis_root,
         forks,
         contract_storage,
+        execution_header,
     } = serde_cbor::from_slice(&encoded_inputs).unwrap();
+
+    // SECURITY: the entire `store` is deserialized from prover-controlled input, so any field that
+    // is not re-derived from verified data inside this program must not be trusted. Unlike
+    // `current_sync_committee` (which the contract anchors on-chain via `prevSyncCommitteeHash`),
+    // `next_sync_committee` has no on-chain anchor. If we trusted the supplied value, a malicious
+    // prover could:
+    //   1. commit an arbitrary `nextSyncCommitteeHash` — e.g. with `updates` empty the loop below
+    //      never runs, so nothing constrains it — which the contract then stores as the canonical
+    //      committee for the next period; and
+    //   2. have `verify_update` check an update's signature against this attacker-chosen committee
+    //      (helios verifies updates whose signature period is `store_period + 1` against
+    //      `store.next_sync_committee`), enabling outright beacon-header / execution-state-root
+    //      forgery in a single proof.
+    // A legitimate `next_sync_committee` is only ever produced by `apply_update` after
+    // `verify_update` validates the update's `next_sync_committee` against its Merkle branch (rooted
+    // in a header signed by the trusted current committee). A fresh helios bootstrap also always
+    // starts with `next_sync_committee = None` (see `apply_bootstrap`), so resetting it here is a
+    // no-op for honest provers and the only safe starting point.
+    store.next_sync_committee = None;
 
     // Get the initial sync committee hash. When verifying the proof, this is secured by the
     // `prevSyncCommitteeHash` field in the `ProofOutputs` struct.
@@ -89,24 +110,22 @@ pub fn main() {
         None => NO_NEXT_SYNC_COMMITTEE,
     };
     let head = store.finalized_header.beacon().slot;
-    let execution = store
-        .finalized_header
-        .execution()
-        .expect("Execution payload doesn't exist.");
+    let execution = verified_execution_fields(&store.finalized_header, execution_header.as_ref())
+        .expect("Execution header failed to verify.");
 
     let storage_slots = contract_storage
         .iter()
         .flat_map(|contract_storage| {
-            verify_storage_slot_proofs(*execution.state_root(), contract_storage)
+            verify_storage_slot_proofs(execution.state_root, contract_storage)
                 .expect("Storage slot proofs failed to verify.")
         })
         .collect();
 
     let proof_outputs = ProofOutputs {
-        executionStateRoot: *execution.state_root(),
-        executionBlockHash: *execution.block_hash(),
+        executionStateRoot: execution.state_root,
+        executionBlockHash: execution.block_hash,
         newHeader: header,
-        executionBlockNumber: U256::from(*execution.block_number()),
+        executionBlockNumber: U256::from(execution.block_number),
         nextSyncCommitteeHash: next_sync_committee_hash,
         newHead: U256::from(head),
         prevHeader: prev_header,

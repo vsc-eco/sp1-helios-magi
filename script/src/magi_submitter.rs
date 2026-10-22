@@ -62,15 +62,12 @@ pub struct SubmitProofPayload {
     pub headers: Vec<SubmittedHeader>,
 }
 
+/// One header as the verifier reads it: the RLP alone (bare hex). Every
+/// stored field is parsed from it and bound by its keccak, so nothing else is
+/// sent; each extra byte costs header room under the 8192-byte payload cap.
 #[derive(Serialize)]
 pub struct SubmittedHeader {
     pub rlp_hex: String,
-    pub block_number: u64,
-    pub transactions_root: String,
-    pub receipts_root: String,
-    pub base_fee_per_gas: u64,
-    pub gas_limit: u64,
-    pub timestamp: u64,
 }
 
 /// GraphQL response from submitTransactionV1.
@@ -209,9 +206,14 @@ pub async fn submit_proof(
         headers,
     };
     let payload_json = serde_json::to_string(&payload)?;
+    submit_call(config, "submitProof", &payload_json).await
+}
 
-    // For now: delegate to Go sidecar for CBOR+EIP712 signing
-    let tx_result = call_go_sidecar(config, "submitProof", &payload_json).await?;
+/// Signs `action(payload_json)` on the verifier contract with the
+/// zk-tx-signer sidecar and submits it; returns the L2 tx id.
+pub async fn submit_call(config: &MagiSubmitterConfig, action: &str, payload_json: &str) -> Result<String> {
+    // Delegate to the Go sidecar for CBOR+EIP712 signing.
+    let tx_result = call_go_sidecar(config, action, payload_json).await?;
 
     let graphql_url = config
         .graphql_urls

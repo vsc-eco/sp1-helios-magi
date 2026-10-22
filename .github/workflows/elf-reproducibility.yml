@@ -29,7 +29,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-03-27
         with:
-          toolchain: '1.91.0'
+          toolchain: '1.93.1'
           components: llvm-tools, rustc-dev
 
       - name: Cache cargo registry and build artifacts
@@ -46,13 +46,13 @@ jobs:
       - name: Cache SP1 build Docker image
         uses: ScribeMD/docker-cache@fb28c93772363301b8d0a6072ce850224b73f74e # 0.5.0
         with:
-          key: sp1-build-v6.1.0
+          key: sp1-build-v6.8.1
 
       # Triggers script/build.rs, which invokes the SP1 build inside the
-      # ghcr.io/succinctlabs/sp1:v6.1.0 container and writes ELFs to elf/.
-      # cargo check is enough — we only need build.rs to run, not the host link.
+      # ghcr.io/succinctlabs/sp1:v6.8.1 container (pinned by digest) and writes ELFs to elf/.
+      # cargo check is enough: we only need build.rs to run, not the host link.
       - name: Rebuild ELFs reproducibly via Docker
-        run: cargo check -p magi-zk-oracle-script
+        run: cargo check -p sp1-helios-script
 
       - name: Verify committed ELFs match Docker output
         run: |
