@@ -39,7 +39,7 @@ Beacon Chain (Consensus Layer)
 - `magi_submitter.rs` / `magi_operator.rs`: submit proofs and header batches to the zk-header-verifier on Magi, sized under the node's 8192-byte payload cap, and backfill a header gap right after each proof.
 - `script/build.rs` builds the guest programs in the `ghcr.io/succinctlabs/sp1:v6.8.1` image pinned by digest; `.github/workflows/elf-reproducibility.yml` fails a PR whose committed ELFs differ from that build.
 
-Upstream's Solidity contract (`contracts/`) and its `operator` / `genesis` binaries are not part of the Magi path: they decode upstream's `ProofOutputs` layout, and the binaries are not built.
+Upstream's Solidity contract (`contracts/`) and its `operator` / `genesis` binaries are not part of the Magi path: they decode upstream's `ProofOutputs` layout, and the binaries are not built. Upstream's CI workflows and its operator `Dockerfile` are not carried: CI here is the ELF reproducibility check, with every third-party action pinned by commit.
 
 ## Crates
 
