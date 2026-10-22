@@ -1,0 +1,16 @@
+{
+  "consensusRpc": "http://unstable.sepolia.beacon-api.nimbus.team",
+  "executionRpc": "https://ethereum-sepolia-rpc.publicnode.com",
+  "chainId": 11155111,
+  "gloasForkEpoch": 353024,
+  "capturedAt": "2026-10-22",
+  "bootstrapSlot": 11411808,
+  "finalizedSlot": 11412320,
+  "storage": "none (the execution RPC's eth_getProof window did not reach the finalized block)",
+  "fixtures": [
+    {
+      "file": "sepolia_gloas.cbor",
+      "sha256": "1bdec2de2f6fd51564e3e9fe034e7f9887770153bc942bf652fc86630542fcb4"
+    }
+  ]
+}
