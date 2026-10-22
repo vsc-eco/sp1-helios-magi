@@ -35,7 +35,7 @@ Beacon Chain (Consensus Layer)
 
 - `ProofOutputs` adds `executionBlockHash` (the verifier keccak-checks each submitted RLP header against it) and `genesisRoot` (ABI slot 10, `pvBytes[352:384]`; chain identity, pinned by the verifier). There is no committed `chainId`.
 - "No next sync committee" is committed as `0xFF..FF`, never `ZERO`, so it can not match uninitialized storage (MED Z-PR-M1). Upstream's #54 reset of `store.next_sync_committee` is kept.
-- `magi_prover.rs`: Groth16 only; the consensus client's chain id is re-checked before every finality update (CRIT #23); at startup the local ELF hash must match the verifier's `elfhash` pin (HIGH #22).
+- `magi_prover.rs`: Groth16 only; the consensus client must be configured for the expected chain id (CRIT #23; a consensus RPC serving another chain is caught in-circuit, where the committee signatures are checked under the configured genesis root, and by the verifier's genesis-root and committee anchoring); at startup the local ELF hash must match the verifier's `elfhash` pin (HIGH #22). Before paying for a proof it checks, for free, that the bootstrapped store is at the verifier's beacon head and that the executed outputs continue it (`prevHead`, `newHead`, `genesisRoot`).
 - `magi_submitter.rs` / `magi_operator.rs`: submit proofs and header batches to the zk-header-verifier on Magi, sized under the node's 8192-byte payload cap, and backfill a header gap right after each proof.
 - `script/build.rs` builds the guest programs in the `ghcr.io/succinctlabs/sp1:v6.8.1` image pinned by digest; `.github/workflows/elf-reproducibility.yml` fails a PR whose committed ELFs differ from that build.
 
@@ -82,7 +82,7 @@ cargo run --release --bin magi_operator -- \
   --net-id vsc-testnet
 ```
 
-Each step proves the next finalized update and submits it, then backfills the headers the verifier is missing; it waits for every call to show in the verifier state before the next one.
+Each step proves the next finalized update and submits it, then backfills the headers the verifier is missing; it waits for every call to show in the verifier state before the next one. It proves only when the verifier's program vkey (`sp1vk`) is this ELF's (a proof for another vkey would be refused on chain but still paid for), and after a failed step it waits twice as long each time, up to an hour.
 
 ## Validation
 
@@ -101,13 +101,21 @@ cargo test --locked --release \
 
 The storage tests require Anvil. These tests execute the programs without generating proofs; they check the Magi outputs (`executionBlockHash`, `genesisRoot`, the `0xFF..FF` next-committee value) on both pre- and post-Gloas updates.
 
+## Values for the zk-header-verifier
+
+Whenever `elf/light_client` changes, the verifier needs:
+- the ELF hash for `setExpectedElfHash` (HIGH #22): `sha256sum elf/light_client`
+- the program vkey (`sp1_vkey_hash`, rotated with `propose`/`execute`): `cargo run --release --bin vkey`
+
+The Groth16 verifying key and the vk root belong to the SP1 version, not the program: take them from that release's `sp1-verifier` crate (`vk-artifacts/groth16_vk.bin`, `VK_ROOT_BYTES`), never from a proof. For SP1 6.8.1 they are the same as for 6.1.0.
+
 ## Trust Model
 
 The prover fetches beacon chain data from a consensus RPC (any Nimbus/Lighthouse endpoint). This RPC is **untrusted**: the ZK proof cryptographically verifies sync committee signatures and finality inside the circuit. A malicious RPC cannot produce a valid proof with fake data.
 
 ## Requirements
 
-- Rust 1.91.0
+- Rust 1.93.1 (`script/rust-toolchain`)
 - Docker (the guest programs build in the pinned SP1 image)
 - Any Ethereum consensus RPC endpoint with light-client endpoints (untrusted, data only)
 - A Succinct Prover Network requester key with PROVE funds
