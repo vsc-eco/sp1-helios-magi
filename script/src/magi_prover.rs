@@ -6,7 +6,8 @@
 use crate::execution::ExecutionRpc;
 use crate::get_updates;
 use crate::operator::{collect_update_inputs, network_mode_for, ProverSettings};
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
+use alloy::sol_types::SolType;
 use anyhow::{Context, Result};
 use helios_consensus_core::consensus_spec::MainnetConsensusSpec;
 use helios_consensus_core::types::FinalityUpdate;
@@ -14,7 +15,7 @@ use helios_ethereum::consensus::Inner;
 use helios_ethereum::rpc::http_rpc::HttpRpc;
 use helios_ethereum::rpc::ConsensusRpc;
 use sha2::{Digest, Sha256};
-use sp1_helios_primitives::types::ProofInputs;
+use sp1_helios_primitives::types::{ProofInputs, ProofOutputs};
 use sp1_sdk::{
     network::FulfillmentStrategy, HashableKey, NetworkProver, ProveRequest, Prover, ProverClient,
     ProvingKey, SP1ProofMode, SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin,
@@ -284,10 +285,16 @@ impl MagiZkProver {
         head: u64,
     ) -> Result<Option<SP1ProofWithPublicValues>> {
         let updates = get_updates(client).await?;
-        // CRIT #23: refuse a consensus client that drifted to another chain.
+        // CRIT #23: the client must be configured for this prover's chain id.
+        // magi_operator builds both from --source-chain-id, so there this only
+        // guards a client built for another chain. A consensus RPC serving
+        // another chain is caught in-circuit (the committee signatures are
+        // checked under the configured genesis root and fork domain, so the free
+        // local execute fails before any proof is paid for) and by the
+        // verifier's genesis-root and committee anchoring.
         if client.config.chain.chain_id != self.chain_id {
             anyhow::bail!(
-                "CRIT #23: consensus client chain_id ({}) does not match prover's expected chain_id ({}) — refusing to fetch finality update against wrong chain",
+                "CRIT #23: consensus client chain_id ({}) does not match prover's expected chain_id ({}); refusing to fetch finality update against wrong chain",
                 client.config.chain.chain_id,
                 self.chain_id,
             );
@@ -306,6 +313,15 @@ impl MagiZkProver {
         } else if !latest_block.is_multiple_of(32) {
             info!("Non-checkpoint slot {latest_block}. Skipping.");
             return Ok(None);
+        }
+        // The verifier only takes a proof that starts at its beacon head (RV-4).
+        // A consensus RPC that bootstrapped from another checkpoint would make
+        // every paid proof a reject, so check before paying.
+        let store_slot = client.store.finalized_header.beacon().slot;
+        if store_slot != head {
+            anyhow::bail!(
+                "bootstrapped store is at slot {store_slot}, not the verifier's beacon head {head}; not proving"
+            );
         }
         info!("Proving update from slot {head} to {latest_block}");
 
@@ -335,6 +351,9 @@ impl MagiZkProver {
             .execute(LIGHT_CLIENT_ELF.into(), stdin)
             .await
             .context("Execution failed")?;
+        // The executed outputs are what the proof will commit: check them
+        // against what the verifier requires before paying for the proof.
+        check_outputs(public_values.as_slice(), head, latest_block, client.config.chain.genesis_root)?;
         let mut proof = self
             .client
             .prove(&self.lightclient_pk, prove_stdin)
@@ -356,6 +375,26 @@ impl MagiZkProver {
     pub fn lightclient_vkey(&self) -> String {
         self.lightclient_pk.verifying_key().bytes32()
     }
+}
+
+/// The executed public values must continue the verifier: start at its beacon
+/// head, end at the finalized slot being proven, under its genesis root. A
+/// proof that does not is refused on chain, so it must not be paid for.
+pub fn check_outputs(public_values: &[u8], head: u64, latest_block: u64, genesis_root: B256) -> Result<()> {
+    let outputs =
+        ProofOutputs::abi_decode(public_values).context("executed public values are not ProofOutputs")?;
+    if outputs.prevHead != U256::from(head)
+        || outputs.newHead != U256::from(latest_block)
+        || outputs.genesisRoot != genesis_root
+    {
+        anyhow::bail!(
+            "executed outputs do not continue the verifier (prevHead {}, newHead {}, genesisRoot {}; want {head}, {latest_block}, {genesis_root}); not proving",
+            outputs.prevHead,
+            outputs.newHead,
+            outputs.genesisRoot,
+        );
+    }
+    Ok(())
 }
 
 /// Prover Network settings from the environment, as the upstream operator reads
@@ -382,4 +421,38 @@ pub async fn prover_settings_from_env() -> Result<ProverSettings> {
         NetworkSigner::local(&key).context("failed to create local Prover Network signer")?
     };
     Ok(ProverSettings { network_signer, fulfillment_strategy, proof_mode: SP1ProofMode::Groth16 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::sol_types::SolValue;
+
+    fn pv(prev: u64, new: u64, genesis: B256) -> Vec<u8> {
+        ProofOutputs {
+            prevHeader: B256::ZERO,
+            prevHead: U256::from(prev),
+            prevSyncCommitteeHash: B256::ZERO,
+            newHead: U256::from(new),
+            newHeader: B256::ZERO,
+            executionStateRoot: B256::ZERO,
+            executionBlockHash: B256::ZERO,
+            executionBlockNumber: U256::ZERO,
+            syncCommitteeHash: B256::ZERO,
+            nextSyncCommitteeHash: B256::repeat_byte(0xff),
+            genesisRoot: genesis,
+            storageSlots: vec![],
+        }
+        .abi_encode()
+    }
+
+    #[test]
+    fn pays_only_for_outputs_that_continue_the_verifier() {
+        let g = B256::repeat_byte(0xd8);
+        assert!(check_outputs(&pv(8192, 8224, g), 8192, 8224, g).is_ok());
+        assert!(check_outputs(&pv(8160, 8224, g), 8192, 8224, g).is_err()); // starts elsewhere
+        assert!(check_outputs(&pv(8192, 8256, g), 8192, 8224, g).is_err()); // ends elsewhere
+        assert!(check_outputs(&pv(8192, 8224, B256::ZERO), 8192, 8224, g).is_err()); // other chain
+        assert!(check_outputs(&[0u8; 31], 8192, 8224, g).is_err()); // not ProofOutputs
+    }
 }
