@@ -41,6 +41,12 @@ async fn gloas_execution_and_rejection() {
             assert_eq!(report.exit_code, 0);
             let (previous, head, root, number, slots) = if mode == 0 {
                 let output = ProofOutputs::abi_decode(values.as_slice()).unwrap();
+                // Magi outputs: the zk-header-verifier keccak-checks the submitted RLP
+                // header against executionBlockHash and pins genesisRoot; "no next
+                // committee" is 0xFF..FF, never ZERO.
+                assert_eq!(output.executionBlockHash, header.hash_slow());
+                assert_eq!(output.genesisRoot, inputs.genesis_root);
+                assert_ne!(output.nextSyncCommitteeHash, B256::ZERO);
                 (
                     output.prevHead,
                     output.newHead,

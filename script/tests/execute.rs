@@ -13,6 +13,7 @@
 
 use alloy::primitives::B256;
 use alloy::sol_types::SolType;
+use sp1_helios_primitives::execution::verified_execution_fields;
 use sp1_helios_primitives::types::{ExecutionHeaderProofOutputs, ProofInputs, ProofOutputs};
 use sp1_sdk::{Elf, Prover, ProverClient, SP1Stdin};
 use tree_hash::TreeHash;
@@ -136,10 +137,11 @@ async fn verified_next_sync_committee_is_committed() {
         outputs.genesisRoot, inputs.genesis_root,
         "committed genesisRoot is not the genesis_validators_root the updates were verified with"
     );
-    assert_ne!(
-        outputs.executionBlockHash,
-        B256::ZERO,
-        "light client did not commit the finalized execution block hash"
+    let finalized = verified_execution_fields(&inputs.finality_update.finalized_header(), None)
+        .expect("pre-Gloas fixture header carries its execution payload header");
+    assert_eq!(
+        outputs.executionBlockHash, finalized.block_hash,
+        "committed executionBlockHash is not the finalized header's execution block hash"
     );
 }
 
