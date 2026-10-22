@@ -45,6 +45,8 @@ pub struct VerifierState {
     /// "lbh": hash of the newest stored header.
     pub last_hash: B256,
     pub gap: Option<Gap>,
+    /// "sp1vk": the light-client program vkey the verifier accepts proofs for.
+    pub program_vkey: Option<String>,
 }
 
 /// An open header gap (E5): "gapw", "gapl", "gapb", "gapa".
@@ -75,7 +77,28 @@ fn hash(state: &HashMap<String, Option<String>>, key: &str) -> Result<B256> {
 }
 
 /// The keys `parse_verifier_state` reads.
-pub const STATE_KEYS: [&str; 7] = ["bh", "h", "lbh", "gapw", "gapl", "gapb", "gapa"];
+pub const STATE_KEYS: [&str; 8] = ["bh", "h", "lbh", "gapw", "gapl", "gapb", "gapa", "sp1vk"];
+
+/// Whether the verifier's program vkey is the one this prover proves with. A
+/// proof for another vkey is refused on chain, so it must not be paid for.
+/// The value is read as the node reads it for sp1_verify_groth16 (an optional
+/// lowercase "0x", then 32 bytes of hex), so a value the node cannot use
+/// never matches.
+pub fn vkey_matches(on_chain: Option<&str>, local: &str) -> bool {
+    let bytes = |s: &str| hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok().filter(|b| b.len() == 32);
+    match (on_chain.and_then(bytes), bytes(local)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// How long to wait after `failures` failed steps in a row: `idle` doubled per
+/// failure, at most 64 x idle and one hour. A step that keeps failing (a
+/// misconfigured net id, contract or RC) must not re-prove every minute.
+pub fn backoff(idle: Duration, failures: u32) -> Duration {
+    let factor = 1u32 << failures.saturating_sub(1).min(6);
+    idle.saturating_mul(factor).min(Duration::from_secs(3600))
+}
 
 /// Parses the verifier state read with `STATE_KEYS`. A missing key reads as
 /// null or "" on Magi; the gap is open iff "gapw" is set.
@@ -94,6 +117,7 @@ pub fn parse_verifier_state(state: &HashMap<String, Option<String>>) -> Result<V
         last_height: num(state, "h")?,
         last_hash: hash(state, "lbh")?,
         gap,
+        program_vkey: get(state, "sp1vk").map(str::to_string),
     })
 }
 
@@ -125,6 +149,21 @@ pub fn fit_newest(rlps: &[Vec<u8>], payload: impl Fn(&[Vec<u8>]) -> String) -> u
         k -= 1;
     }
     k
+}
+
+/// The blocks a backfill fetches: the newest `MAX_HEADERS_PER_CALL` below the
+/// gap's lowest stored header, never into the stored chain. The verifier only
+/// opens a gap with at least one block missing; any other reading (a node
+/// serving bad state) is an error rather than an empty range to unwrap.
+pub fn backfill_range(gap: &Gap) -> Result<(u64, u64)> {
+    ensure!(
+        gap.low > gap.base.saturating_add(1),
+        "verifier gap is empty or inverted (low {}, base {})",
+        gap.low,
+        gap.base
+    );
+    let top = gap.low - 1;
+    Ok(((gap.base + 1).max(top.saturating_sub(MAX_HEADERS_PER_CALL as u64 - 1)), top))
 }
 
 /// Headers `lo..=hi` from the execution RPC, oldest first, checked to chain
@@ -203,8 +242,7 @@ impl MagiOperator {
     }
 
     async fn backfill(&self, gap: &Gap) -> Result<()> {
-        let top = gap.low - 1;
-        let lo = (gap.base + 1).max(top.saturating_sub(MAX_HEADERS_PER_CALL as u64 - 1));
+        let (lo, top) = backfill_range(gap)?;
         let headers = fetch_chain(&self.execution_rpc, lo, top).await?;
         ensure!(
             headers.last().unwrap().hash_slow() == gap.want,
@@ -232,6 +270,13 @@ impl MagiOperator {
     }
 
     async fn prove(&self, st: &VerifierState) -> Result<Step> {
+        let local = self.prover.lightclient_vkey();
+        if !vkey_matches(st.program_vkey.as_deref(), &local) {
+            bail!(
+                "the verifier's program vkey ({}) is not this prover's ({local}); not proving (rotate the verifier's vkey or run the matching ELF)",
+                st.program_vkey.as_deref().unwrap_or("unset")
+            );
+        }
         let client = get_client(Some(st.beacon_head), &self.consensus_rpc, self.chain_id).await?;
         let Some(proof) = self.prover.prove_header_update(&client, st.beacon_head).await? else {
             return Ok(Step::Idle);
@@ -265,7 +310,8 @@ impl MagiOperator {
         let payload = proof_payload(&proof_bytes, &pv, &rlps[rlps.len() - k..]);
         let tx = submit_call(&self.submitter, "submitProof", &payload).await?;
         info!("submitProof tx {tx}");
-        self.wait_for("submitProof", |s| s.beacon_head == new_head).await?;
+        // >=: another operator's proof may land past this one.
+        self.wait_for("submitProof", |s| s.beacon_head >= new_head).await?;
         Ok(Step::Proved)
     }
 }
@@ -301,6 +347,46 @@ mod tests {
         assert_eq!(gap.want, H1.parse::<B256>().unwrap());
         // An open gap missing a field is an error, not a closed gap.
         assert!(parse_verifier_state(&state(&open[..5])).is_err());
+    }
+
+    #[test]
+    fn proves_only_for_the_verifiers_vkey() {
+        let local = "0x0065cd93b7f8b0a1e99c0c7cf7de78be52c7a3fc7cb605fcc05273b1d029af2c";
+        assert!(vkey_matches(Some(local), local));
+        // Hex digits in either case and no prefix decode as the node decodes them.
+        assert!(vkey_matches(Some("0x0065CD93B7F8B0A1E99C0C7CF7DE78BE52C7A3FC7CB605FCC05273B1D029AF2C"), local));
+        assert!(vkey_matches(Some(&local[2..]), local));
+        // "0X" is not stripped by the node, so it cannot verify anything.
+        assert!(!vkey_matches(Some("0X0065CD93B7F8B0A1E99C0C7CF7DE78BE52C7A3FC7CB605FCC05273B1D029AF2C"), local));
+        assert!(!vkey_matches(Some("0x00aa"), local));
+        assert!(!vkey_matches(Some(""), local));
+        assert!(!vkey_matches(None, local));
+        let st = parse_verifier_state(&state(&[("bh", "8224"), ("h", "140"), ("lbh", H1), ("sp1vk", local)])).unwrap();
+        assert_eq!(st.program_vkey.as_deref(), Some(local));
+    }
+
+    #[test]
+    fn backfill_stays_between_the_stored_chain_and_the_gap() {
+        let gap = |low, base| Gap { want: B256::ZERO, low, base, anchor: B256::ZERO };
+        assert_eq!(backfill_range(&gap(129, 100)).unwrap(), (117, 128));
+        assert_eq!(backfill_range(&gap(105, 100)).unwrap(), (101, 104));
+        assert_eq!(backfill_range(&gap(102, 100)).unwrap(), (101, 101));
+        assert!(backfill_range(&gap(101, 100)).is_err()); // nothing missing
+        assert!(backfill_range(&gap(50, 100)).is_err()); // inverted
+        assert!(backfill_range(&gap(0, 0)).is_err());
+        assert!(backfill_range(&gap(u64::MAX, u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn backs_off_doubling_up_to_an_hour() {
+        let m = Duration::from_secs(60);
+        assert_eq!(backoff(m, 1), m);
+        assert_eq!(backoff(m, 2), 2 * m);
+        assert_eq!(backoff(m, 4), 8 * m);
+        assert_eq!(backoff(m, 7), Duration::from_secs(3600));
+        assert_eq!(backoff(m, 1000), Duration::from_secs(3600));
+        assert_eq!(backoff(Duration::from_secs(10), 7), Duration::from_secs(640));
+        assert_eq!(backoff(Duration::MAX, 3), Duration::from_secs(3600));
     }
 
     #[test]

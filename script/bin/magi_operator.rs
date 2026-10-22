@@ -11,7 +11,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
 use sp1_helios_script::execution::ExecutionRpc;
-use sp1_helios_script::magi_operator::{MagiOperator, Step};
+use sp1_helios_script::magi_operator::{backoff, MagiOperator, Step};
 use sp1_helios_script::magi_prover::{prover_settings_from_env, ElfPinConfig, MagiZkProver};
 use sp1_helios_script::magi_submitter::MagiSubmitterConfig;
 use std::time::Duration;
@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
     };
 
     let idle = Duration::from_secs(args.loop_delay_mins * 60);
+    let mut failures = 0u32;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -103,11 +104,16 @@ async fn main() -> Result<()> {
             }
             step = operator.run_once() => match step {
                 // Backfill right after a proof: no new proof lands while a gap is open.
-                Ok(Step::Proved) | Ok(Step::Backfilled) => continue,
-                Ok(Step::Idle) => tokio::time::sleep(idle).await,
-                Err(e) => {
-                    error!("operator step failed: {e:#}");
+                Ok(Step::Proved) | Ok(Step::Backfilled) => failures = 0,
+                Ok(Step::Idle) => {
+                    failures = 0;
                     tokio::time::sleep(idle).await;
+                }
+                Err(e) => {
+                    failures += 1;
+                    let wait = backoff(idle, failures);
+                    error!("operator step failed ({failures} in a row), next try in {wait:?}: {e:#}");
+                    tokio::time::sleep(wait).await;
                 }
             },
         }
