@@ -26,3 +26,6 @@ agents/
 .claude/
 .codex/
 .shellbrain/
+
+# Local upstream checkout
+sp1-helios/
