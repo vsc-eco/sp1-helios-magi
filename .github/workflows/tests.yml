@@ -1,0 +1,61 @@
+name: tests
+
+# The Magi prover's and operator's tests: unit, execute (pre-Gloas fixture),
+# gloas (upstream's post-Gloas fixtures), sepolia (a recorded post-Gloas
+# Sepolia update) and storage_collection (anvil). Every action is pinned by
+# commit (a tag can be moved), the token is read-only, and anvil comes from a
+# pinned foundry release checked against its published sha256 (no curl | bash).
+# The guest ELFs are the committed ones (SP1_SKIP_PROGRAM_BUILD);
+# elf-reproducibility.yml rebuilds them in the pinned SP1 image.
+on:
+  pull_request:
+  push:
+    branches: [audit-review-7-med]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SP1_SKIP_PROGRAM_BUILD: "true"
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        working-directory: script
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: protoc (prost/tonic build scripts)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Rust toolchain (script/rust-toolchain)
+        run: rustup toolchain install --no-self-update
+
+      - name: anvil (foundry v1.7.1, sha256 checked)
+        run: |
+          curl -sSfL -o /tmp/foundry.tgz https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz
+          echo "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tgz" | sha256sum -c -
+          mkdir -p "$HOME/foundry" && tar -xzf /tmp/foundry.tgz -C "$HOME/foundry"
+          echo "$HOME/foundry" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'script/rust-toolchain') }}
+
+      - name: unit
+        run: cargo test --release --lib --bins
+      - name: execute
+        run: cargo test --release --test execute
+      - name: gloas
+        run: cargo test --release --test gloas
+      - name: sepolia
+        run: cargo test --release --test sepolia
+      - name: storage_collection
+        run: cargo test --release --test storage_collection
