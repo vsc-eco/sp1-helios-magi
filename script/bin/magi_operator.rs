@@ -48,6 +48,11 @@ struct Args {
     /// Minutes a submitted call may take to show in the verifier state.
     #[arg(long, default_value_t = 3)]
     land_timeout_mins: u64,
+    /// Stop after this many proofs have been paid for on the Prover Network
+    /// (landed or not), once the header gap they opened is backfilled. Unset: no
+    /// limit.
+    #[arg(long)]
+    max_proofs: Option<u64>,
 }
 
 #[tokio::main]
@@ -92,19 +97,35 @@ async fn main() -> Result<()> {
         chain_id: args.source_chain_id,
         submitter,
         land_timeout: Duration::from_secs(args.land_timeout_mins * 60),
+        proofs_paid: std::sync::atomic::AtomicU64::new(0),
     };
 
     let idle = Duration::from_secs(args.loop_delay_mins * 60);
     let mut failures = 0u32;
+    let mut landed = 0u64;
+    if let Some(max) = args.max_proofs {
+        info!("proof budget: {max} paid proof(s), then stop once the header gap is backfilled");
+    }
     loop {
+        let paid = operator.proofs_paid.load(std::sync::atomic::Ordering::SeqCst);
+        let may_prove = args.max_proofs.map_or(true, |max| paid < max);
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Stopping");
                 return Ok(());
             }
-            step = operator.run_once() => match step {
+            step = operator.run_once(may_prove) => match step {
+                Ok(Step::Proved) => {
+                    failures = 0;
+                    landed += 1;
+                    info!("{landed} proof(s) landed");
+                }
                 // Backfill right after a proof: no new proof lands while a gap is open.
-                Ok(Step::Proved) | Ok(Step::Backfilled) => failures = 0,
+                Ok(Step::Backfilled) => failures = 0,
+                Ok(Step::BudgetSpent) => {
+                    info!("proof budget spent ({paid} paid, {landed} landed) and no header gap open; stopping");
+                    return Ok(());
+                }
                 Ok(Step::Idle) => {
                     failures = 0;
                     tokio::time::sleep(idle).await;

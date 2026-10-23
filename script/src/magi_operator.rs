@@ -193,6 +193,26 @@ pub enum Step {
     Backfilled,
     /// Nothing new to prove.
     Idle,
+    /// The proof budget is spent and no gap is open: a proof would be next.
+    BudgetSpent,
+}
+
+/// What the next step does: an open gap is always backfilled (a proof that
+/// already landed is completed even past the budget); otherwise prove, unless
+/// the proof budget is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextAction {
+    Backfill,
+    Prove,
+    Stop,
+}
+
+pub fn next_action(gap_open: bool, may_prove: bool) -> NextAction {
+    match (gap_open, may_prove) {
+        (true, _) => NextAction::Backfill,
+        (false, true) => NextAction::Prove,
+        (false, false) => NextAction::Stop,
+    }
 }
 
 pub struct MagiOperator {
@@ -203,6 +223,9 @@ pub struct MagiOperator {
     pub submitter: MagiSubmitterConfig,
     /// How long a submitted call may take to show in the verifier state.
     pub land_timeout: Duration,
+    /// Proofs the Prover Network returned (paid), landed or not: what
+    /// --max-proofs counts, so a paid proof that fails to land still counts.
+    pub proofs_paid: std::sync::atomic::AtomicU64,
 }
 
 impl MagiOperator {
@@ -233,11 +256,14 @@ impl MagiOperator {
     }
 
     /// One step: backfill if a gap is open, else prove and submit.
-    pub async fn run_once(&self) -> Result<Step> {
+    /// One step. With may_prove false (the proof budget is spent) a step that
+    /// would request a paid proof returns BudgetSpent instead.
+    pub async fn run_once(&self, may_prove: bool) -> Result<Step> {
         let st = self.state().await?;
-        match st.gap.clone() {
-            Some(gap) => self.backfill(&gap).await.map(|_| Step::Backfilled),
-            None => self.prove(&st).await,
+        match next_action(st.gap.is_some(), may_prove) {
+            NextAction::Backfill => self.backfill(st.gap.as_ref().unwrap()).await.map(|_| Step::Backfilled),
+            NextAction::Prove => self.prove(&st).await,
+            NextAction::Stop => Ok(Step::BudgetSpent),
         }
     }
 
@@ -281,6 +307,8 @@ impl MagiOperator {
         let Some(proof) = self.prover.prove_header_update(&client, st.beacon_head).await? else {
             return Ok(Step::Idle);
         };
+        let paid = self.proofs_paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        info!("proof {paid} received from the Prover Network");
         let pv = proof.public_values.to_vec();
         let po = ProofOutputs::abi_decode(&pv).context("public values are not ProofOutputs")?;
         let tip: u64 = po.executionBlockNumber.try_into().context("execution block number")?;
@@ -318,6 +346,15 @@ impl MagiOperator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_spent_budget_stops_only_once_the_gap_is_backfilled() {
+        use super::{next_action, NextAction::*};
+        assert_eq!(next_action(true, true), Backfill);
+        assert_eq!(next_action(true, false), Backfill, "a landed proof's gap is completed past the budget");
+        assert_eq!(next_action(false, true), Prove);
+        assert_eq!(next_action(false, false), Stop, "no paid proof once the budget is spent");
+    }
+
     use super::*;
 
     fn state(kv: &[(&str, &str)]) -> HashMap<String, Option<String>> {
