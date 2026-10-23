@@ -105,6 +105,16 @@ The storage tests require Anvil. These tests execute the programs without genera
 
 ## Values for the zk-header-verifier
 
+A fresh verifier's `init` payload comes from `magi_genesis`, from one beacon light-client bootstrap at a finalized checkpoint (the latest, or `--slot`): `initial_head`, `initial_sync_committee_hash` and `genesis_root` from the bootstrap, the anchor (`initial_height`, `initial_block_hash`) from the execution block that checkpoint finalizes (checked against the beacon header), `sp1_vkey_hash` from the committed ELF, and `groth16_vk` / `vk_root` from SP1 6.8.1. It also prints the ELF hash for the first `setExpectedElfHash`. Nothing is sent; review the output, then call `init`.
+
+```bash
+cargo run --release --bin magi_genesis -- \
+  --source-chain-id 11155111 \
+  --source-consensus-rpc "$SOURCE_CONSENSUS_RPC_URL" \
+  --source-execution-rpc "$SOURCE_EXECUTION_RPC_URL" \
+  --is-testnet > init.json
+```
+
 Whenever `elf/light_client` changes, the verifier needs:
 - the ELF hash for `setExpectedElfHash` (HIGH #22): `sha256sum elf/light_client`
 - the program vkey (`sp1_vkey_hash`, rotated with `propose`/`execute`): `cargo run --release --bin vkey`

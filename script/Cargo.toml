@@ -22,6 +22,7 @@ cuda = ["sp1-sdk/cuda"]
 
 [dependencies]
 sp1-sdk = { workspace = true }
+sp1-verifier = "=6.8.1"
 tokio = { workspace = true }
 helios-consensus-core = { workspace = true }
 helios-ethereum = { workspace = true }
@@ -56,3 +57,7 @@ path = "bin/benchmark.rs"
 [[bin]]
 name = "magi_operator"
 path = "bin/magi_operator.rs"
+
+[[bin]]
+name = "magi_genesis"
+path = "bin/magi_genesis.rs"
