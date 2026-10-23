@@ -84,6 +84,8 @@ cargo run --release --bin magi_operator -- \
 
 Each step proves the next finalized update and submits it, then backfills the headers the verifier is missing; it waits for every call to show in the verifier state before the next one. It proves only when the verifier's program vkey (`sp1vk`) is this ELF's (a proof for another vkey would be refused on chain but still paid for), and after a failed step it waits twice as long each time, up to an hour.
 
+Every proof is paid on the Prover Network. `--max-proofs N` stops the operator once it has been sent N proofs (counted when the network returns one, so a proof that then fails to land still counts) and the header gap they opened is backfilled; `--max-proofs 1` is a single paid proof, for a first run.
+
 ## Validation
 
 The recorded Plataberget fixtures contain signed Gloas updates, execution headers, and source storage proofs.
