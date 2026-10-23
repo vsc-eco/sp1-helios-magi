@@ -8834,6 +8834,7 @@ dependencies = [
  "sp1-build",
  "sp1-helios-primitives",
  "sp1-sdk",
+ "sp1-verifier",
  "tokio",
  "tracing",
  "tracing-subscriber",
