@@ -32,6 +32,9 @@ use tracing::info;
 
 /// go-vsc-node `params.MAX_CONTRACT_PAYLOAD_SIZE`: a contract call's payload.
 pub const MAX_CONTRACT_PAYLOAD: usize = 8192;
+
+/// Beacon slots per sync committee period (the verifier's SlotsPerSyncPeriod).
+pub const SLOTS_PER_SYNC_PERIOD: u64 = 8192;
 /// zk-header-verifier `MaxHeadersPerTx`.
 pub const MAX_HEADERS_PER_CALL: usize = 12;
 
@@ -239,6 +242,20 @@ impl MagiOperator {
         parse_verifier_state(&raw)
     }
 
+    /// The verifier's trusted sync committee hash for period(head) ("sc-<period>"),
+    /// the committee a proof from `head` must start from. Missing means the
+    /// verifier would refuse any proof from this head, so nothing is proved.
+    async fn trusted_committee(&self, head: u64) -> Result<B256> {
+        let key = format!("sc-{}", head / SLOTS_PER_SYNC_PERIOD);
+        let raw = crate::magi_prover::fetch_contract_state(
+            &self.submitter.graphql_urls,
+            &self.submitter.contract_id,
+            &[key.as_str()],
+        )
+        .await?;
+        hash(&raw, &key).context("the verifier holds no sync committee for its beacon head's period; not proving")
+    }
+
     /// Polls the verifier state until `done` holds or `land_timeout` passes.
     async fn wait_for(&self, what: &str, done: impl Fn(&VerifierState) -> bool) -> Result<()> {
         let start = Instant::now();
@@ -303,11 +320,16 @@ impl MagiOperator {
                 st.program_vkey.as_deref().unwrap_or("unset")
             );
         }
+        let committee = self.trusted_committee(st.beacon_head).await?;
         let client = get_client(Some(st.beacon_head), &self.consensus_rpc, self.chain_id).await?;
-        let Some(proof) = self.prover.prove_header_update(&client, st.beacon_head).await? else {
+        let Some(proof) = self
+            .prover
+            .prove_header_update(&client, st.beacon_head, committee, &self.proofs_paid)
+            .await?
+        else {
             return Ok(Step::Idle);
         };
-        let paid = self.proofs_paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let paid = self.proofs_paid.load(std::sync::atomic::Ordering::SeqCst);
         info!("proof {paid} received from the Prover Network");
         let pv = proof.public_values.to_vec();
         let po = ProofOutputs::abi_decode(&pv).context("public values are not ProofOutputs")?;
@@ -356,6 +378,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn reads_the_trusted_committee_as_the_verifier_stores_it() {
+        // The verifier stores "sc-<period>" as bare lowercase hex
+        // (normalizeHash32), unlike "lbh", which carries 0x.
+        let bare = "827cc35b6e6fda5f987d7c04634679f14a6bc4a7675ee49b5698a7e161c10545";
+        let mut m: HashMap<String, Option<String>> = HashMap::new();
+        m.insert("sc-1393".into(), Some(bare.into()));
+        let got = hash(&m, "sc-1393").unwrap();
+        assert_eq!(got, format!("0x{bare}").parse::<B256>().unwrap());
+        assert!(hash(&m, "sc-1394").is_err()); // no committee for that period
+        assert_eq!(11411808 / SLOTS_PER_SYNC_PERIOD, 1393);
+    }
 
     fn state(kv: &[(&str, &str)]) -> HashMap<String, Option<String>> {
         let mut m: HashMap<String, Option<String>> = STATE_KEYS.iter().map(|k| (k.to_string(), None)).collect();

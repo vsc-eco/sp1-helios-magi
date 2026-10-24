@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use sp1_helios_script::get_client;
+use tree_hash::TreeHash;
 use sp1_helios_script::magi_prover::{prover_settings_from_env, MagiZkProver};
 use std::time::Instant;
 #[derive(Parser)]
@@ -32,7 +33,12 @@ async fn main() -> Result<()> {
     eprintln!("current: {} bootstrap: {}", current_slot, bootstrap_slot);
     let client = get_client(Some(bootstrap_slot), &args.consensus_rpc, args.chain_id).await?;
     let t = Instant::now();
-    let proof = prover.prove_header_update(&client, 0).await?;
+    // Prove from the bootstrap itself: its slot is the head and its current
+    // committee the trusted one (there is no verifier to read them from).
+    let head = client.store.finalized_header.clone().beacon().slot;
+    let committee = client.store.current_sync_committee.clone().tree_hash_root();
+    let paid = std::sync::atomic::AtomicU64::new(0);
+    let proof = prover.prove_header_update(&client, head, committee, &paid).await?;
     if let Some(p) = proof {
         eprintln!(
             "TIME: {:.1}s PROOF: {}B PV: {}B",
