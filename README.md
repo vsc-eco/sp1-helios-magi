@@ -107,6 +107,8 @@ The storage tests require Anvil. These tests execute the programs without genera
 
 A fresh verifier's `init` payload comes from `magi_genesis`, from one beacon light-client bootstrap at a finalized checkpoint (the latest, or `--slot`): `initial_head`, `initial_sync_committee_hash` and `genesis_root` from the bootstrap, the anchor (`initial_height`, `initial_block_hash`) from the execution block that checkpoint finalizes (checked against the beacon header), `sp1_vkey_hash` from the committed ELF, and `groth16_vk` / `vk_root` from SP1 6.8.1. It also prints the ELF hash for the first `setExpectedElfHash`. Nothing is sent; review the output, then call `init`.
 
+The checkpoint is the verifier's trust root. Without `--slot`, its block root comes from the checkpoint-sync services helios queries, independent of `--source-consensus-rpc`; use that for a real init. With `--slot`, the root comes from the consensus RPC itself, which could serve a bootstrap of its own: compare the printed `checkpoint block root` with an independent beacon node or explorer before calling `init`.
+
 ```bash
 cargo run --release --bin magi_genesis -- \
   --source-chain-id 11155111 \
