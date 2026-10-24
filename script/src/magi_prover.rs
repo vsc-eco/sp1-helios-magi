@@ -278,11 +278,15 @@ impl MagiZkProver {
 
     /// Prove the light-client update from `head` (the verifier's last proven
     /// beacon slot) to the latest finalized checkpoint. `None` when there is
-    /// nothing new to prove.
+    /// nothing new to prove. `trusted_committee` is the verifier's stored sync
+    /// committee hash for period(head); `paid` counts every proof the Prover
+    /// Network returns, before anything here can still fail.
     pub async fn prove_header_update(
         &self,
         client: &Inner<MainnetConsensusSpec, HttpRpc>,
         head: u64,
+        trusted_committee: B256,
+        paid: &std::sync::atomic::AtomicU64,
     ) -> Result<Option<SP1ProofWithPublicValues>> {
         let updates = get_updates(client).await?;
         // CRIT #23: the client must be configured for this prover's chain id.
@@ -353,7 +357,7 @@ impl MagiZkProver {
             .context("Execution failed")?;
         // The executed outputs are what the proof will commit: check them
         // against what the verifier requires before paying for the proof.
-        check_outputs(public_values.as_slice(), head, latest_block, client.config.chain.genesis_root)?;
+        check_outputs(public_values.as_slice(), head, latest_block, client.config.chain.genesis_root, trusted_committee)?;
         let mut proof = self
             .client
             .prove(&self.lightclient_pk, prove_stdin)
@@ -361,6 +365,9 @@ impl MagiZkProver {
             .strategy(self.fulfillment_strategy)
             .await
             .context("Groth16 proving failed")?;
+        // Paid from here on, whatever happens next (a failed local verify
+        // below still cost a proof, and --max-proofs must count it).
+        paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         proof.public_values = public_values;
         // Verify locally before publishing: catches any divergence between the
         // executed public values and what the prover bound into the SNARK.
@@ -378,20 +385,31 @@ impl MagiZkProver {
 }
 
 /// The executed public values must continue the verifier: start at its beacon
-/// head, end at the finalized slot being proven, under its genesis root. A
-/// proof that does not is refused on chain, so it must not be paid for.
-pub fn check_outputs(public_values: &[u8], head: u64, latest_block: u64, genesis_root: B256) -> Result<()> {
+/// head from the sync committee it trusts for that period, end at the finalized
+/// slot being proven, under its genesis root. A proof that does not is refused
+/// on chain, so it must not be paid for. The committee check matters because
+/// the consensus RPC is untrusted: it can serve a self-consistent bootstrap with
+/// a committee of its own, which proves fine and is refused only on chain.
+pub fn check_outputs(
+    public_values: &[u8],
+    head: u64,
+    latest_block: u64,
+    genesis_root: B256,
+    trusted_committee: B256,
+) -> Result<()> {
     let outputs =
         ProofOutputs::abi_decode(public_values).context("executed public values are not ProofOutputs")?;
     if outputs.prevHead != U256::from(head)
         || outputs.newHead != U256::from(latest_block)
         || outputs.genesisRoot != genesis_root
+        || outputs.prevSyncCommitteeHash != trusted_committee
     {
         anyhow::bail!(
-            "executed outputs do not continue the verifier (prevHead {}, newHead {}, genesisRoot {}; want {head}, {latest_block}, {genesis_root}); not proving",
+            "executed outputs do not continue the verifier (prevHead {}, newHead {}, genesisRoot {}, prevSyncCommitteeHash {}; want {head}, {latest_block}, {genesis_root}, {trusted_committee}); not proving",
             outputs.prevHead,
             outputs.newHead,
             outputs.genesisRoot,
+            outputs.prevSyncCommitteeHash,
         );
     }
     Ok(())
@@ -429,10 +447,14 @@ mod tests {
     use alloy::sol_types::SolValue;
 
     fn pv(prev: u64, new: u64, genesis: B256) -> Vec<u8> {
+        pvc(prev, new, genesis, B256::repeat_byte(0xc0))
+    }
+
+    fn pvc(prev: u64, new: u64, genesis: B256, committee: B256) -> Vec<u8> {
         ProofOutputs {
             prevHeader: B256::ZERO,
             prevHead: U256::from(prev),
-            prevSyncCommitteeHash: B256::ZERO,
+            prevSyncCommitteeHash: committee,
             newHead: U256::from(new),
             newHeader: B256::ZERO,
             executionStateRoot: B256::ZERO,
@@ -449,10 +471,13 @@ mod tests {
     #[test]
     fn pays_only_for_outputs_that_continue_the_verifier() {
         let g = B256::repeat_byte(0xd8);
-        assert!(check_outputs(&pv(8192, 8224, g), 8192, 8224, g).is_ok());
-        assert!(check_outputs(&pv(8160, 8224, g), 8192, 8224, g).is_err()); // starts elsewhere
-        assert!(check_outputs(&pv(8192, 8256, g), 8192, 8224, g).is_err()); // ends elsewhere
-        assert!(check_outputs(&pv(8192, 8224, B256::ZERO), 8192, 8224, g).is_err()); // other chain
-        assert!(check_outputs(&[0u8; 31], 8192, 8224, g).is_err()); // not ProofOutputs
+        let c = B256::repeat_byte(0xc0);
+        assert!(check_outputs(&pv(8192, 8224, g), 8192, 8224, g, c).is_ok());
+        assert!(check_outputs(&pv(8160, 8224, g), 8192, 8224, g, c).is_err()); // starts elsewhere
+        assert!(check_outputs(&pv(8192, 8256, g), 8192, 8224, g, c).is_err()); // ends elsewhere
+        assert!(check_outputs(&pv(8192, 8224, B256::ZERO), 8192, 8224, g, c).is_err()); // other chain
+        assert!(check_outputs(&[0u8; 31], 8192, 8224, g, c).is_err()); // not ProofOutputs
+        // A committee the verifier does not trust (an RPC's own bootstrap).
+        assert!(check_outputs(&pvc(8192, 8224, g, B256::repeat_byte(0x66)), 8192, 8224, g, c).is_err());
     }
 }
