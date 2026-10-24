@@ -13,6 +13,13 @@
 //!
 //! The consensus RPC must serve `light_client/bootstrap` for that checkpoint.
 //! Nothing is sent anywhere: the owner reviews the output and calls `init`.
+//!
+//! The checkpoint is the trust root of the verifier. Without `--slot` its block
+//! root comes from the checkpoint-sync services helios queries, independent of
+//! the consensus RPC; with `--slot` it comes from the consensus RPC itself,
+//! which could hand over a bootstrap of its own. The root and its source are
+//! printed; with `--slot`, compare the root with an independent beacon node or
+//! explorer before calling `init`.
 
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
@@ -103,6 +110,13 @@ async fn main() -> Result<()> {
         "initial_head": head,
         "is_testnet": args.is_testnet,
     });
+    let root = client.store.finalized_header.clone().beacon().tree_hash_root();
+    let source = if args.slot.is_some() {
+        "the consensus RPC itself (--slot): verify it against an independent beacon node or explorer before init"
+    } else {
+        "checkpoint-sync services, independent of the consensus RPC"
+    };
+    eprintln!("checkpoint block root {root:#x}, from {source}");
     eprintln!("bootstrap slot {head}, period {}, execution block {} {:#x}", head / 8192, execution.block_number, execution.block_hash);
     eprintln!("setExpectedElfHash (first pin): {}", hex::encode(Sha256::digest(LIGHT_CLIENT_ELF)));
     println!("{}", serde_json::to_string_pretty(&init)?);
