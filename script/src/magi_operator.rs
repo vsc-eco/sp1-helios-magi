@@ -110,8 +110,10 @@ pub enum Demand {
 /// Reads the bot's needs file (`{"want_proof", "since", "reasons", "updated"}`,
 /// unix seconds): prove when a proof has been wanted for `batch_window`. A file
 /// not updated for `stale_after` means the bot is down; then nobody would use
-/// a proof (map, attest, confirm), so nothing is proved.
-pub fn demand(needs: &str, now: u64, batch_window: Duration, stale_after: Duration) -> Demand {
+/// a proof (map, attest, confirm), so nothing is proved. A file not updated
+/// since `not_before` (when this operator's last proof landed) still asks for
+/// that proof: the bot has not seen it land yet.
+pub fn demand(needs: &str, now: u64, batch_window: Duration, stale_after: Duration, not_before: u64) -> Demand {
     let v: serde_json::Value = match serde_json::from_str(needs) {
         Ok(v) => v,
         Err(e) => return Demand::Wait(format!("needs file unreadable: {e}")),
@@ -119,6 +121,9 @@ pub fn demand(needs: &str, now: u64, batch_window: Duration, stale_after: Durati
     let updated = v["updated"].as_u64().unwrap_or(0);
     if now.saturating_sub(updated) > stale_after.as_secs() {
         return Demand::Wait(format!("needs file not updated for {}s; is the bot running?", now.saturating_sub(updated)));
+    }
+    if updated <= not_before {
+        return Demand::Wait("needs file predates the last proof landing".into());
     }
     if v["want_proof"] != serde_json::Value::Bool(true) {
         return Demand::Wait("no proof wanted".into());
@@ -173,6 +178,8 @@ pub struct MagiOperator {
     pub batch_window: Duration,
     /// A needs file older than this means the bot is down.
     pub needs_stale_after: Duration,
+    /// Unix time the last proof landed: a needs file must be newer to count.
+    pub last_landed: std::sync::atomic::AtomicU64,
 }
 
 impl MagiOperator {
@@ -223,7 +230,8 @@ impl MagiOperator {
         if let Some(path) = &self.needs_file {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
             let needs = std::fs::read_to_string(path).unwrap_or_default();
-            match demand(&needs, now, self.batch_window, self.needs_stale_after) {
+            let not_before = self.last_landed.load(std::sync::atomic::Ordering::SeqCst);
+            match demand(&needs, now, self.batch_window, self.needs_stale_after, not_before) {
                 Demand::Wait(why) => {
                     info!("not proving: {why}");
                     return Ok(Step::Idle);
@@ -280,6 +288,8 @@ impl MagiOperator {
         // >=: another operator's proof may land past this one.
         self.wait_for("submitProof", |s| s.beacon_head >= new_head).await?;
         self.prover.limits.clear_request(); // RP-10: landed, nothing to resume
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        self.last_landed.store(now, std::sync::atomic::Ordering::SeqCst);
         Ok(Step::Proved)
     }
 }
@@ -364,12 +374,15 @@ mod tests {
         let f = |want: bool, since: u64, updated: u64| {
             serde_json::json!({"want_proof": want, "since": since, "updated": updated, "reasons": ["x"]}).to_string()
         };
-        assert!(matches!(demand(&f(false, 0, 1000), 1000, w, stale), Demand::Wait(_)), "nothing wanted: idle");
-        assert!(matches!(demand(&f(true, 900, 1000), 1000, w, stale), Demand::Wait(_)), "wanted 100 s: still batching");
-        assert!(matches!(demand(&f(true, 400, 1000), 1000, w, stale), Demand::Prove(_)), "wanted 600 s: prove");
-        assert!(matches!(demand(&f(true, 0, 10), 1000, w, stale), Demand::Wait(_)), "bot silent 990 s: not proving");
-        assert!(matches!(demand("", 1000, w, stale), Demand::Wait(_)), "no file");
-        assert!(matches!(demand(&f(true, 1000, 1000), 1000, Duration::ZERO, stale), Demand::Prove(_)), "no batching");
+        assert!(matches!(demand(&f(false, 0, 1000), 1000, w, stale, 0), Demand::Wait(_)), "nothing wanted: idle");
+        assert!(matches!(demand(&f(true, 900, 1000), 1000, w, stale, 0), Demand::Wait(_)), "wanted 100 s: still batching");
+        assert!(matches!(demand(&f(true, 400, 1000), 1000, w, stale, 0), Demand::Prove(_)), "wanted 600 s: prove");
+        assert!(matches!(demand(&f(true, 0, 10), 1000, w, stale, 0), Demand::Wait(_)), "bot silent 990 s: not proving");
+        assert!(matches!(demand("", 1000, w, stale, 0), Demand::Wait(_)), "no file");
+        assert!(matches!(demand(&f(true, 1000, 1000), 1000, Duration::ZERO, stale, 0), Demand::Prove(_)), "no batching");
+        // A request written before the last proof landed is that proof's.
+        assert!(matches!(demand(&f(true, 400, 995), 1000, w, stale, 996), Demand::Wait(_)), "stale request: no second proof");
+        assert!(matches!(demand(&f(true, 400, 997), 1000, w, stale, 996), Demand::Prove(_)), "a request after the landing counts");
     }
 
     #[test]

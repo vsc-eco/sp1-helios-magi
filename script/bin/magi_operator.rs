@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
         needs_file: args.needs_file.clone(),
         batch_window: Duration::from_secs(args.batch_window_mins * 60),
         needs_stale_after: Duration::from_secs(args.needs_stale_mins * 60),
+        last_landed: std::sync::atomic::AtomicU64::new(0),
     };
     match &args.needs_file {
         Some(p) => info!("on demand: proving only while {} wants a proof (batch window {} min)", p.display(), args.batch_window_mins),
