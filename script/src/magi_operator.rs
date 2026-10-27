@@ -1,18 +1,20 @@
 //! RV-5: the Magi operator loop.
 //!
-//! Each step does one thing and waits for it to land on Magi:
-//! - a header gap is open (E5): backfill the newest blocks below it with
-//!   `submitHeaders`;
-//! - otherwise: prove the latest finalized checkpoint from the verifier's
-//!   beacon head and `submitProof` it with as many of the newest headers as fit.
+//! Each step proves the latest finalized checkpoint from the verifier's beacon
+//! head and `submitProof`s it with the proven block's header, then waits for it
+//! to land on Magi. RP-9: the verifier stores headers on demand, so a proof
+//! carries only its own block's header and nothing is backfilled; the bot
+//! stores the other headers the bridge needs (attestHeaders).
 //!
-//! A call's payload is capped at go-vsc-node's `MAX_CONTRACT_PAYLOAD_SIZE`
-//! (8192 bytes), which with Prague headers (~620 bytes of RLP, hex-encoded)
-//! is about 5 headers next to a proof and 6 in a backfill, under the
-//! verifier's own 12. Checkpoints are ~32 blocks apart, so every proof opens a
-//! gap the following steps close. Every header is checked locally against the
-//! hash the verifier wants before it is sent, so a wrong-chain RPC fails here
-//! rather than burning RC on a call the contract refuses.
+//! On demand (RP-9, owner 10-27): with a needs file (the bot's NEEDS_FILE) the
+//! operator proves only while the bot wants a proof, once the request has
+//! waited the batch window (default 10 min) so one proof covers what arrives
+//! meanwhile; idle otherwise, so an idle bridge costs nothing. Without one it
+//! proves every new checkpoint, as before.
+//!
+//! The proven header is checked locally against the proven block hash before
+//! it is sent, so a wrong-chain RPC fails here rather than burning RC on a call
+//! the contract refuses.
 //!
 //! Run one operator per verifier: two would submit the same step, and the
 //! second call fails on chain (harmless, but it costs RC).
@@ -22,7 +24,6 @@ use crate::get_client;
 use crate::magi_prover::MagiZkProver;
 use crate::magi_submitter::{submit_call, MagiSubmitterConfig, SubmittedHeader};
 use alloy::sol_types::SolType;
-use alloy_consensus::Header;
 use alloy_primitives::B256;
 use anyhow::{bail, ensure, Context, Result};
 use sp1_helios_primitives::types::ProofOutputs;
@@ -45,24 +46,8 @@ pub struct VerifierState {
     pub beacon_head: u64,
     /// "h": the last proven execution block.
     pub last_height: u64,
-    /// "lbh": hash of the newest stored header.
-    pub last_hash: B256,
-    pub gap: Option<Gap>,
     /// "sp1vk": the light-client program vkey the verifier accepts proofs for.
     pub program_vkey: Option<String>,
-}
-
-/// An open header gap (E5): "gapw", "gapl", "gapb", "gapa".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gap {
-    /// Hash the next backfilled header must have (the parent of `low`).
-    pub want: B256,
-    /// Lowest stored header above the gap.
-    pub low: u64,
-    /// The stored chain's tip below the gap.
-    pub base: u64,
-    /// Hash of `base`, which the backfill must link to.
-    pub anchor: B256,
 }
 
 fn get<'a>(state: &'a HashMap<String, Option<String>>, key: &str) -> Option<&'a str> {
@@ -80,7 +65,7 @@ fn hash(state: &HashMap<String, Option<String>>, key: &str) -> Result<B256> {
 }
 
 /// The keys `parse_verifier_state` reads.
-pub const STATE_KEYS: [&str; 8] = ["bh", "h", "lbh", "gapw", "gapl", "gapb", "gapa", "sp1vk"];
+pub const STATE_KEYS: [&str; 3] = ["bh", "h", "sp1vk"];
 
 /// Whether the verifier's program vkey is the one this prover proves with. A
 /// proof for another vkey is refused on chain, so it must not be paid for.
@@ -104,24 +89,46 @@ pub fn backoff(idle: Duration, failures: u32) -> Duration {
 }
 
 /// Parses the verifier state read with `STATE_KEYS`. A missing key reads as
-/// null or "" on Magi; the gap is open iff "gapw" is set.
+/// null or "" on Magi.
 pub fn parse_verifier_state(state: &HashMap<String, Option<String>>) -> Result<VerifierState> {
-    let gap = match get(state, "gapw") {
-        None => None,
-        Some(_) => Some(Gap {
-            want: hash(state, "gapw")?,
-            low: num(state, "gapl")?,
-            base: num(state, "gapb")?,
-            anchor: hash(state, "gapa")?,
-        }),
-    };
     Ok(VerifierState {
         beacon_head: num(state, "bh")?,
         last_height: num(state, "h")?,
-        last_hash: hash(state, "lbh")?,
-        gap,
         program_vkey: get(state, "sp1vk").map(str::to_string),
     })
+}
+
+/// Whether to prove now, from the bot's needs file (RP-9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Demand {
+    /// The bot wants a proof and the batch window has passed.
+    Prove(String),
+    /// Nothing wanted, or the batch window is still open.
+    Wait(String),
+}
+
+/// Reads the bot's needs file (`{"want_proof", "since", "reasons", "updated"}`,
+/// unix seconds): prove when a proof has been wanted for `batch_window`. A file
+/// not updated for `stale_after` means the bot is down; then nobody would use
+/// a proof (map, attest, confirm), so nothing is proved.
+pub fn demand(needs: &str, now: u64, batch_window: Duration, stale_after: Duration) -> Demand {
+    let v: serde_json::Value = match serde_json::from_str(needs) {
+        Ok(v) => v,
+        Err(e) => return Demand::Wait(format!("needs file unreadable: {e}")),
+    };
+    let updated = v["updated"].as_u64().unwrap_or(0);
+    if now.saturating_sub(updated) > stale_after.as_secs() {
+        return Demand::Wait(format!("needs file not updated for {}s; is the bot running?", now.saturating_sub(updated)));
+    }
+    if v["want_proof"] != serde_json::Value::Bool(true) {
+        return Demand::Wait("no proof wanted".into());
+    }
+    let since = v["since"].as_u64().unwrap_or(now);
+    let waited = now.saturating_sub(since);
+    if waited < batch_window.as_secs() {
+        return Demand::Wait(format!("proof wanted for {waited}s, batching up to {}s", batch_window.as_secs()));
+    }
+    Demand::Prove(v["reasons"].to_string())
 }
 
 fn headers_json(rlps: &[Vec<u8>]) -> Vec<SubmittedHeader> {
@@ -138,84 +145,15 @@ pub fn proof_payload(proof: &[u8], public_values: &[u8], rlps: &[Vec<u8>]) -> St
     .to_string()
 }
 
-/// The submitHeaders payload.
-pub fn headers_payload(rlps: &[Vec<u8>]) -> String {
-    serde_json::json!({ "headers": headers_json(rlps) }).to_string()
-}
-
-/// The most of the newest headers in `rlps` (oldest first) that one call can
-/// carry: at most `MAX_HEADERS_PER_CALL`, and `payload` of them within
-/// `MAX_CONTRACT_PAYLOAD` bytes. 0 if not even the newest fits.
-pub fn fit_newest(rlps: &[Vec<u8>], payload: impl Fn(&[Vec<u8>]) -> String) -> usize {
-    let mut k = rlps.len().min(MAX_HEADERS_PER_CALL);
-    while k > 0 && payload(&rlps[rlps.len() - k..]).len() > MAX_CONTRACT_PAYLOAD {
-        k -= 1;
-    }
-    k
-}
-
-/// The blocks a backfill fetches: the newest `MAX_HEADERS_PER_CALL` below the
-/// gap's lowest stored header, never into the stored chain. The verifier only
-/// opens a gap with at least one block missing; any other reading (a node
-/// serving bad state) is an error rather than an empty range to unwrap.
-pub fn backfill_range(gap: &Gap) -> Result<(u64, u64)> {
-    ensure!(
-        gap.low > gap.base.saturating_add(1),
-        "verifier gap is empty or inverted (low {}, base {})",
-        gap.low,
-        gap.base
-    );
-    let top = gap.low - 1;
-    Ok(((gap.base + 1).max(top.saturating_sub(MAX_HEADERS_PER_CALL as u64 - 1)), top))
-}
-
-/// Headers `lo..=hi` from the execution RPC, oldest first, checked to chain
-/// by parent hash.
-async fn fetch_chain(rpc: &ExecutionRpc, lo: u64, hi: u64) -> Result<Vec<Header>> {
-    let mut out = Vec::with_capacity((hi - lo + 1) as usize);
-    for n in lo..=hi {
-        out.push(rpc.header_by_number(n).await?);
-    }
-    for w in out.windows(2) {
-        ensure!(
-            w[1].parent_hash == w[0].hash_slow(),
-            "execution RPC headers {} and {} do not chain",
-            w[0].number,
-            w[1].number
-        );
-    }
-    Ok(out)
-}
-
 /// What one step did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     /// A proof landed.
     Proved,
-    /// A backfill batch landed.
-    Backfilled,
-    /// Nothing new to prove.
+    /// Nothing new to prove, or no proof wanted yet.
     Idle,
-    /// The proof budget is spent and no gap is open: a proof would be next.
+    /// The proof budget is spent: a proof would be next.
     BudgetSpent,
-}
-
-/// What the next step does: an open gap is always backfilled (a proof that
-/// already landed is completed even past the budget); otherwise prove, unless
-/// the proof budget is spent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NextAction {
-    Backfill,
-    Prove,
-    Stop,
-}
-
-pub fn next_action(gap_open: bool, may_prove: bool) -> NextAction {
-    match (gap_open, may_prove) {
-        (true, _) => NextAction::Backfill,
-        (false, true) => NextAction::Prove,
-        (false, false) => NextAction::Stop,
-    }
 }
 
 pub struct MagiOperator {
@@ -229,6 +167,12 @@ pub struct MagiOperator {
     /// Proofs the Prover Network returned (paid), landed or not: what
     /// --max-proofs counts, so a paid proof that fails to land still counts.
     pub proofs_paid: std::sync::atomic::AtomicU64,
+    /// RP-9: the bot's needs file (on demand); None proves every checkpoint.
+    pub needs_file: Option<std::path::PathBuf>,
+    /// How long a wanted proof waits so one proof covers what arrives meanwhile.
+    pub batch_window: Duration,
+    /// A needs file older than this means the bot is down.
+    pub needs_stale_after: Duration,
 }
 
 impl MagiOperator {
@@ -272,44 +216,26 @@ impl MagiOperator {
         }
     }
 
-    /// One step: backfill if a gap is open, else prove and submit.
-    /// One step. With may_prove false (the proof budget is spent) a step that
-    /// would request a paid proof returns BudgetSpent instead.
+    /// One step: prove and submit, if a proof is wanted. With may_prove false
+    /// (the proof budget is spent) a step that would request a paid proof
+    /// returns BudgetSpent instead.
     pub async fn run_once(&self, may_prove: bool) -> Result<Step> {
+        if let Some(path) = &self.needs_file {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let needs = std::fs::read_to_string(path).unwrap_or_default();
+            match demand(&needs, now, self.batch_window, self.needs_stale_after) {
+                Demand::Wait(why) => {
+                    info!("not proving: {why}");
+                    return Ok(Step::Idle);
+                }
+                Demand::Prove(why) => info!("proof wanted: {why}"),
+            }
+        }
+        if !may_prove {
+            return Ok(Step::BudgetSpent);
+        }
         let st = self.state().await?;
-        match next_action(st.gap.is_some(), may_prove) {
-            NextAction::Backfill => self.backfill(st.gap.as_ref().unwrap()).await.map(|_| Step::Backfilled),
-            NextAction::Prove => self.prove(&st).await,
-            NextAction::Stop => Ok(Step::BudgetSpent),
-        }
-    }
-
-    async fn backfill(&self, gap: &Gap) -> Result<()> {
-        let (lo, top) = backfill_range(gap)?;
-        let headers = fetch_chain(&self.execution_rpc, lo, top).await?;
-        ensure!(
-            headers.last().unwrap().hash_slow() == gap.want,
-            "execution RPC block {top} is not the parent of the verifier's lowest stored header (want {})",
-            gap.want
-        );
-        let rlps: Vec<Vec<u8>> = headers.iter().map(alloy_rlp::encode).collect();
-        let k = fit_newest(&rlps, headers_payload);
-        ensure!(k > 0, "one header does not fit a {MAX_CONTRACT_PAYLOAD}-byte payload");
-        let batch = &headers[headers.len() - k..];
-        let first = batch[0].number;
-        if first == gap.base + 1 {
-            ensure!(
-                batch[0].parent_hash == gap.anchor,
-                "backfill reaches the stored chain at {first} but does not link to it (stored tip {})",
-                gap.anchor
-            );
-        }
-        info!("submitHeaders {first}..={top} ({k} headers)");
-        let tx = submit_call(&self.submitter, "submitHeaders", &headers_payload(&rlps[rlps.len() - k..])).await?;
-        info!("submitHeaders tx {tx}");
-        let low = gap.low;
-        self.wait_for("submitHeaders", |st| st.gap.as_ref().map_or(true, |g| g.low < low))
-            .await
+        self.prove(&st).await
     }
 
     async fn prove(&self, st: &VerifierState) -> Result<Step> {
@@ -337,46 +263,29 @@ impl MagiOperator {
         let new_head: u64 = po.newHead.try_into().context("beacon head")?;
         ensure!(tip > st.last_height, "proven block {tip} is not above the stored tip {}", st.last_height);
 
-        let lo = (st.last_height + 1).max(tip.saturating_sub(MAX_HEADERS_PER_CALL as u64 - 1));
-        let headers = fetch_chain(&self.execution_rpc, lo, tip).await?;
+        // RP-9: only the proven block's header; the bot attests the others.
+        let header = self.execution_rpc.header_by_number(tip).await?;
         ensure!(
-            headers.last().unwrap().hash_slow() == po.executionBlockHash,
+            header.hash_slow() == po.executionBlockHash,
             "execution RPC block {tip} is not the proven block {}",
             po.executionBlockHash
         );
-        if lo == st.last_height + 1 {
-            ensure!(
-                headers[0].parent_hash == st.last_hash,
-                "execution RPC block {lo} does not link to the verifier's stored tip {}",
-                st.last_hash
-            );
-        }
-        let rlps: Vec<Vec<u8>> = headers.iter().map(alloy_rlp::encode).collect();
+        let rlps = vec![alloy_rlp::encode(&header)];
         let proof_bytes = proof.bytes();
-        let k = fit_newest(&rlps, |h| proof_payload(&proof_bytes, &pv, h));
-        ensure!(k > 0, "the proof and one header do not fit a {MAX_CONTRACT_PAYLOAD}-byte payload");
-        let first = tip - k as u64 + 1;
-        info!("submitProof slot {} -> {new_head}, blocks {first}..={tip} ({k} headers)", st.beacon_head);
-        let payload = proof_payload(&proof_bytes, &pv, &rlps[rlps.len() - k..]);
+        let payload = proof_payload(&proof_bytes, &pv, &rlps);
+        ensure!(payload.len() <= MAX_CONTRACT_PAYLOAD, "the proof and its header do not fit a {MAX_CONTRACT_PAYLOAD}-byte payload");
+        info!("submitProof slot {} -> {new_head}, block {tip}", st.beacon_head);
         let tx = submit_call(&self.submitter, "submitProof", &payload).await?;
         info!("submitProof tx {tx}");
         // >=: another operator's proof may land past this one.
         self.wait_for("submitProof", |s| s.beacon_head >= new_head).await?;
+        self.prover.limits.clear_request(); // RP-10: landed, nothing to resume
         Ok(Step::Proved)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_spent_budget_stops_only_once_the_gap_is_backfilled() {
-        use super::{next_action, NextAction::*};
-        assert_eq!(next_action(true, true), Backfill);
-        assert_eq!(next_action(true, false), Backfill, "a landed proof's gap is completed past the budget");
-        assert_eq!(next_action(false, true), Prove);
-        assert_eq!(next_action(false, false), Stop, "no paid proof once the budget is spent");
-    }
-
     use super::*;
 
     #[test]
@@ -400,25 +309,12 @@ mod tests {
         m
     }
 
-    const H1: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
-
     #[test]
-    fn reads_the_gap_only_when_open() {
-        let base = [("bh", "8224"), ("h", "140"), ("lbh", H1)];
-        let st = parse_verifier_state(&state(&base)).unwrap();
-        assert_eq!(st.gap, None);
-        assert_eq!((st.beacon_head, st.last_height), (8224, 140));
-        // A deleted key reads as "" on Magi.
-        let st = parse_verifier_state(&state(&[base[0], base[1], base[2], ("gapw", "")])).unwrap();
-        assert_eq!(st.gap, None);
-
-        let bare = &H1[2..];
-        let open = [base[0], base[1], base[2], ("gapw", bare), ("gapl", "129"), ("gapb", "100"), ("gapa", bare)];
-        let gap = parse_verifier_state(&state(&open)).unwrap().gap.unwrap();
-        assert_eq!((gap.low, gap.base), (129, 100));
-        assert_eq!(gap.want, H1.parse::<B256>().unwrap());
-        // An open gap missing a field is an error, not a closed gap.
-        assert!(parse_verifier_state(&state(&open[..5])).is_err());
+    fn reads_the_verifier_state() {
+        let st = parse_verifier_state(&state(&[("bh", "8224"), ("h", "140")])).unwrap();
+        assert_eq!((st.beacon_head, st.last_height, st.program_vkey), (8224, 140, None));
+        assert!(parse_verifier_state(&state(&[("bh", "8224")])).is_err());
+        assert!(parse_verifier_state(&state(&[("bh", "8224"), ("h", "")])).is_err()); // deleted reads as ""
     }
 
     #[test]
@@ -433,20 +329,8 @@ mod tests {
         assert!(!vkey_matches(Some("0x00aa"), local));
         assert!(!vkey_matches(Some(""), local));
         assert!(!vkey_matches(None, local));
-        let st = parse_verifier_state(&state(&[("bh", "8224"), ("h", "140"), ("lbh", H1), ("sp1vk", local)])).unwrap();
+        let st = parse_verifier_state(&state(&[("bh", "8224"), ("h", "140"), ("sp1vk", local)])).unwrap();
         assert_eq!(st.program_vkey.as_deref(), Some(local));
-    }
-
-    #[test]
-    fn backfill_stays_between_the_stored_chain_and_the_gap() {
-        let gap = |low, base| Gap { want: B256::ZERO, low, base, anchor: B256::ZERO };
-        assert_eq!(backfill_range(&gap(129, 100)).unwrap(), (117, 128));
-        assert_eq!(backfill_range(&gap(105, 100)).unwrap(), (101, 104));
-        assert_eq!(backfill_range(&gap(102, 100)).unwrap(), (101, 101));
-        assert!(backfill_range(&gap(101, 100)).is_err()); // nothing missing
-        assert!(backfill_range(&gap(50, 100)).is_err()); // inverted
-        assert!(backfill_range(&gap(0, 0)).is_err());
-        assert!(backfill_range(&gap(u64::MAX, u64::MAX)).is_err());
     }
 
     #[test]
@@ -463,31 +347,48 @@ mod tests {
 
     #[test]
     fn payloads_are_the_verifier_shape() {
-        let rlps = vec![vec![0xf9, 0x02], vec![0xab]];
+        let rlps = vec![vec![0xf9, 0x02]];
         let p: serde_json::Value = serde_json::from_str(&proof_payload(&[1, 2], &[3], &rlps)).unwrap();
         assert_eq!(p["proof"], "0102");
         assert_eq!(p["public_values"], "03");
         assert_eq!(p["headers"][0]["rlp_hex"], "f902");
-        assert_eq!(p["headers"][1]["rlp_hex"], "ab");
         assert_eq!(p["headers"][0].as_object().unwrap().len(), 1);
-        let h: serde_json::Value = serde_json::from_str(&headers_payload(&rlps)).unwrap();
-        assert_eq!(h.as_object().unwrap().len(), 1);
-        assert_eq!(h["headers"][1]["rlp_hex"], "ab");
+        // A Groth16 proof, its public values and one ~680-byte Glamsterdam header fit.
+        assert!(proof_payload(&[0u8; 356], &[0u8; 448], &[vec![0u8; 700]]).len() <= MAX_CONTRACT_PAYLOAD);
     }
 
     #[test]
-    fn fits_the_payload_cap_and_the_header_cap() {
-        // ~620-byte Prague headers: 5 next to a Groth16 proof and its public values.
-        let rlps = vec![vec![0u8; 620]; 12];
-        let (proof, pv) = (vec![0u8; 356], vec![0u8; 448]);
-        let k = fit_newest(&rlps, |h| proof_payload(&proof, &pv, h));
-        assert_eq!(k, 5);
-        assert!(proof_payload(&proof, &pv, &rlps[12 - k..]).len() <= MAX_CONTRACT_PAYLOAD);
-        assert!(proof_payload(&proof, &pv, &rlps[12 - k - 1..]).len() > MAX_CONTRACT_PAYLOAD);
-        assert_eq!(fit_newest(&rlps, headers_payload), 6);
-        // Small headers stop at the verifier's 12.
-        assert_eq!(fit_newest(&vec![vec![0u8; 10]; 20], headers_payload), MAX_HEADERS_PER_CALL);
-        // Nothing fits.
-        assert_eq!(fit_newest(&[vec![0u8; 5000]], headers_payload), 0);
+    fn proves_on_demand_after_the_batch_window() {
+        let w = Duration::from_secs(600);
+        let stale = Duration::from_secs(900);
+        let f = |want: bool, since: u64, updated: u64| {
+            serde_json::json!({"want_proof": want, "since": since, "updated": updated, "reasons": ["x"]}).to_string()
+        };
+        assert!(matches!(demand(&f(false, 0, 1000), 1000, w, stale), Demand::Wait(_)), "nothing wanted: idle");
+        assert!(matches!(demand(&f(true, 900, 1000), 1000, w, stale), Demand::Wait(_)), "wanted 100 s: still batching");
+        assert!(matches!(demand(&f(true, 400, 1000), 1000, w, stale), Demand::Prove(_)), "wanted 600 s: prove");
+        assert!(matches!(demand(&f(true, 0, 10), 1000, w, stale), Demand::Wait(_)), "bot silent 990 s: not proving");
+        assert!(matches!(demand("", 1000, w, stale), Demand::Wait(_)), "no file");
+        assert!(matches!(demand(&f(true, 1000, 1000), 1000, Duration::ZERO, stale), Demand::Prove(_)), "no batching");
+    }
+
+    #[test]
+    fn a_pending_request_round_trips_and_clears() {
+        use crate::magi_prover::{NetworkLimits, PendingRequest};
+        let dir = std::env::temp_dir().join(format!("magi-req-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = NetworkLimits { request_file: Some(dir.join("req.json")), ..Default::default() };
+        assert_eq!(l.load_request().unwrap(), None);
+        let r = PendingRequest { request_id: B256::repeat_byte(7), head: 8224, latest_block: 8256 };
+        l.save_request(&r).unwrap();
+        assert_eq!(l.load_request().unwrap(), Some(r));
+        l.clear_request();
+        assert_eq!(l.load_request().unwrap(), None);
+        // No file configured: nothing is kept.
+        let none = NetworkLimits::default();
+        none.save_request(&PendingRequest { request_id: B256::ZERO, head: 1, latest_block: 2 }).unwrap();
+        assert_eq!(none.load_request().unwrap(), None);
+        assert_eq!(NetworkLimits::default().max_price_per_pgu, 300_000_000, "0.3 PROVE per billion PGU");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
