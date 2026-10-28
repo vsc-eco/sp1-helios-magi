@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use tree_hash::TreeHash;
 
 /// Z-PR-M4 (MED #41): bound the ELF-pin GraphQL call.
 ///
@@ -442,6 +443,19 @@ impl MagiZkProver {
             anyhow::bail!(
                 "bootstrapped store is at slot {store_slot}, not the verifier's beacon head {head}; not proving"
             );
+        }
+        // BOOTSTRAP-1: the proven checkpoint becomes the verifier's head, and the
+        // next proof bootstraps the light client there. Some finalized
+        // checkpoints have no light-client bootstrap on any public beacon API
+        // (phase C3, Sepolia epochs 357882-357883): a proof landing on one stops
+        // every later proof. Prove only to a checkpoint whose bootstrap is
+        // served; otherwise wait for the next finality update (~6.4 min).
+        let target_root = finality_update.finalized_header().beacon().tree_hash_root();
+        if let Err(e) = <HttpRpc as ConsensusRpc<MainnetConsensusSpec>>::get_bootstrap(&client.rpc, target_root).await {
+            info!(
+                "BOOTSTRAP-1: no light-client bootstrap for the target checkpoint (slot {latest_block}, root {target_root}): {e}; waiting for the next finality update"
+            );
+            return Ok(None);
         }
         info!("Proving update from slot {head} to {latest_block}");
 
