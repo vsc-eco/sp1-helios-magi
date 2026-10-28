@@ -67,6 +67,12 @@ struct Args {
     /// Minutes without a needs-file update after which the bot is taken as down.
     #[arg(long, default_value_t = 15)]
     needs_stale_mins: u64,
+    /// With --needs-file: prove when the verifier's beacon head is older than
+    /// this many hours, even if the bot wants nothing, so the light client
+    /// never continues from a stale start (Across bounds it at one week).
+    /// 0: never.
+    #[arg(long, default_value_t = 120)]
+    max_head_age_hours: u64,
 }
 
 #[tokio::main]
@@ -124,9 +130,15 @@ async fn main() -> Result<()> {
         batch_window: Duration::from_secs(args.batch_window_mins * 60),
         needs_stale_after: Duration::from_secs(args.needs_stale_mins * 60),
         last_landed: std::sync::atomic::AtomicU64::new(0),
+        max_head_age: Duration::from_secs(args.max_head_age_hours * 3600),
     };
     match &args.needs_file {
-        Some(p) => info!("on demand: proving only while {} wants a proof (batch window {} min)", p.display(), args.batch_window_mins),
+        Some(p) => info!(
+            "on demand: proving only while {} wants a proof (batch window {} min), or when the verifier's head is over {} h old",
+            p.display(),
+            args.batch_window_mins,
+            args.max_head_age_hours
+        ),
         None => info!("no --needs-file: proving every new checkpoint"),
     }
 

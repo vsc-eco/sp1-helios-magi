@@ -10,7 +10,9 @@
 //! operator proves only while the bot wants a proof, once the request has
 //! waited the batch window (default 10 min) so one proof covers what arrives
 //! meanwhile; idle otherwise, so an idle bridge costs nothing. Without one it
-//! proves every new checkpoint, as before.
+//! proves every new checkpoint, as before. Even with nothing wanted, it proves
+//! when the verifier's beacon head is older than `max_head_age` (default 5
+//! days), so the light client never continues from a stale start.
 //!
 //! The proven header is checked locally against the proven block hash before
 //! it is sent, so a wrong-chain RPC fails here rather than burning RC on a call
@@ -29,7 +31,7 @@ use anyhow::{bail, ensure, Context, Result};
 use sp1_helios_primitives::types::ProofOutputs;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 /// go-vsc-node `params.MAX_CONTRACT_PAYLOAD_SIZE`: a contract call's payload.
 pub const MAX_CONTRACT_PAYLOAD: usize = 8192;
@@ -104,6 +106,22 @@ pub fn parse_verifier_state(state: &HashMap<String, Option<String>>) -> Result<V
         last_height: num(state, "h")?,
         program_vkey: get(state, "sp1vk").map(str::to_string),
     })
+}
+
+/// Beacon chain slot length in seconds.
+const SECONDS_PER_SLOT: u64 = 12;
+
+/// How old the verifier's beacon head is, in seconds, when that is over
+/// `max_age` (zero disables the check). A proof continues from the stored head
+/// and trusts that head's sync committee, whose members may since have exited
+/// with nothing at stake (sync-committee signatures are never slashable), so
+/// an old head lets old keys sign a fork the verifier would follow. Across
+/// bounds the head its SP1-Helios proofs may start from at one week for this.
+/// On demand the head moves only when the bridge needs a proof, so a quiet
+/// bridge's head would age without bound; the operator proves at this age.
+pub fn head_too_old(beacon_head: u64, genesis_time: u64, now: u64, max_age: Duration) -> Option<u64> {
+    let age = now.saturating_sub(genesis_time.saturating_add(beacon_head.saturating_mul(SECONDS_PER_SLOT)));
+    (!max_age.is_zero() && age > max_age.as_secs()).then_some(age)
 }
 
 /// Whether to prove now, from the bot's needs file (RP-9).
@@ -188,6 +206,9 @@ pub struct MagiOperator {
     pub needs_stale_after: Duration,
     /// Unix time the last proof landed: a needs file must be newer to count.
     pub last_landed: std::sync::atomic::AtomicU64,
+    /// Prove when the verifier's beacon head is older than this, even if the
+    /// bot wants nothing (see head_too_old). Zero: never.
+    pub max_head_age: Duration,
 }
 
 impl MagiOperator {
@@ -240,10 +261,18 @@ impl MagiOperator {
             let needs = std::fs::read_to_string(path).unwrap_or_default();
             let not_before = self.last_landed.load(std::sync::atomic::Ordering::SeqCst);
             match demand(&needs, now, self.batch_window, self.needs_stale_after, not_before) {
-                Demand::Wait(why) => {
-                    info!("not proving: {why}");
-                    return Ok(Step::Idle);
-                }
+                Demand::Wait(why) => match self.stale_head(now).await {
+                    Some(st) => {
+                        if !may_prove {
+                            return Ok(Step::BudgetSpent);
+                        }
+                        return self.prove(&st).await;
+                    }
+                    None => {
+                        info!("not proving: {why}");
+                        return Ok(Step::Idle);
+                    }
+                },
                 Demand::Prove(why) => info!("proof wanted: {why}"),
             }
         }
@@ -252,6 +281,36 @@ impl MagiOperator {
         }
         let st = self.state().await?;
         self.prove(&st).await
+    }
+
+    /// The verifier state when its beacon head is older than max_head_age. A
+    /// failed read is logged and taken as not stale: the next step reads again.
+    async fn stale_head(&self, now: u64) -> Option<VerifierState> {
+        if self.max_head_age.is_zero() {
+            return None;
+        }
+        let genesis_time = match helios_ethereum::config::networks::Network::from_chain_id(self.chain_id) {
+            Ok(n) => n.to_base_config().chain.genesis_time,
+            Err(_) => {
+                warn!("chain {} has no known beacon genesis time; not checking the head's age", self.chain_id);
+                return None;
+            }
+        };
+        let st = match self.state().await {
+            Ok(st) => st,
+            Err(e) => {
+                warn!("cannot read the verifier state to check its head's age: {e:#}");
+                return None;
+            }
+        };
+        let age = head_too_old(st.beacon_head, genesis_time, now, self.max_head_age)?;
+        info!(
+            "proof wanted: the verifier's beacon head (slot {}) is {} h old, over the {} h limit (nothing else is wanted)",
+            st.beacon_head,
+            age / 3600,
+            self.max_head_age.as_secs() / 3600
+        );
+        Some(st)
     }
 
     async fn prove(&self, st: &VerifierState) -> Result<Step> {
@@ -396,6 +455,20 @@ mod tests {
         // A request written before the last proof landed is that proof's.
         assert!(matches!(demand(&f(true, 400, 995), 1000, w, stale, 996), Demand::Wait(_)), "stale request: no second proof");
         assert!(matches!(demand(&f(true, 400, 997), 1000, w, stale, 996), Demand::Prove(_)), "a request after the landing counts");
+    }
+
+    #[test]
+    fn a_head_over_the_age_limit_is_stale() {
+        let genesis = 1_655_733_600; // Sepolia beacon genesis
+        let day = 86_400;
+        let limit = Duration::from_secs(5 * day);
+        let head = 9_000_000u64;
+        let at = genesis + head * 12; // the head slot's time
+        assert_eq!(head_too_old(head, genesis, at + 5 * day, limit), None, "at the limit: not stale");
+        assert_eq!(head_too_old(head, genesis, at + 5 * day + 1, limit), Some(5 * day + 1), "past the limit");
+        assert_eq!(head_too_old(head, genesis, at + 60 * day, Duration::ZERO), None, "zero: never");
+        assert_eq!(head_too_old(head, genesis, at - 60, limit), None, "a head ahead of the clock");
+        assert_eq!(head_too_old(head, 1_606_824_023, at + 5 * day, limit).is_some(), true, "mainnet genesis is earlier: the same slot is older");
     }
 
     #[test]
