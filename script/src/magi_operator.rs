@@ -34,6 +34,14 @@ use tracing::info;
 /// go-vsc-node `params.MAX_CONTRACT_PAYLOAD_SIZE`: a contract call's payload.
 pub const MAX_CONTRACT_PAYLOAD: usize = 8192;
 
+/// A payload's size as the node counts it against MAX_CONTRACT_PAYLOAD: the
+/// node keeps the payload as the JSON string literal decoded from the call's
+/// CBOR (DecodeTxCbor -> json.RawMessage), two quotes and one backslash per
+/// quote or backslash more than the raw text (LINK-PAYLOAD-1).
+pub fn node_payload_size(payload: &str) -> usize {
+    serde_json::to_string(payload).map(|s| s.len()).unwrap_or(payload.len())
+}
+
 /// Beacon slots per sync committee period (the verifier's SlotsPerSyncPeriod).
 pub const SLOTS_PER_SYNC_PERIOD: u64 = 8192;
 /// zk-header-verifier `MaxHeadersPerTx`.
@@ -281,7 +289,10 @@ impl MagiOperator {
         let rlps = vec![alloy_rlp::encode(&header)];
         let proof_bytes = proof.bytes();
         let payload = proof_payload(&proof_bytes, &pv, &rlps);
-        ensure!(payload.len() <= MAX_CONTRACT_PAYLOAD, "the proof and its header do not fit a {MAX_CONTRACT_PAYLOAD}-byte payload");
+        ensure!(
+            node_payload_size(&payload) <= MAX_CONTRACT_PAYLOAD,
+            "the proof and its header do not fit a {MAX_CONTRACT_PAYLOAD}-byte payload"
+        );
         info!("submitProof slot {} -> {new_head}, block {tip}", st.beacon_head);
         let tx = submit_call(&self.submitter, "submitProof", &payload).await?;
         info!("submitProof tx {tx}");
@@ -364,7 +375,9 @@ mod tests {
         assert_eq!(p["headers"][0]["rlp_hex"], "f902");
         assert_eq!(p["headers"][0].as_object().unwrap().len(), 1);
         // A Groth16 proof, its public values and one ~680-byte Glamsterdam header fit.
-        assert!(proof_payload(&[0u8; 356], &[0u8; 448], &[vec![0u8; 700]]).len() <= MAX_CONTRACT_PAYLOAD);
+        assert!(node_payload_size(&proof_payload(&[0u8; 356], &[0u8; 448], &[vec![0u8; 700]])) <= MAX_CONTRACT_PAYLOAD);
+        // The node counts the JSON string literal: quotes are escaped.
+        assert_eq!(node_payload_size(r#"{"a":"b"}"#), r#""{\"a\":\"b\"}""#.len());
     }
 
     #[test]
