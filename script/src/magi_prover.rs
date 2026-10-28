@@ -303,6 +303,17 @@ impl NetworkLimits {
             let _ = std::fs::remove_file(path);
         }
     }
+
+    /// A fulfilled proof that fails its checks (local verify, the outputs the
+    /// verifier requires) cannot pass by waiting: its saved request is dropped,
+    /// so the next step requests a new proof instead of resuming this one
+    /// forever (RP-10 resumes only a request that can still land).
+    pub fn drop_request_on_err<T>(&self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.clear_request();
+        }
+        r
+    }
 }
 
 pub struct MagiZkProver {
@@ -398,10 +409,18 @@ impl MagiZkProver {
                     }
                 };
                 paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                check_outputs(proof.public_values.as_slice(), head, p.latest_block, client.config.chain.genesis_root, trusted_committee)?;
-                self.client
-                    .verify(&proof, self.lightclient_pk.verifying_key(), None)
-                    .context("Local verification of the resumed proof failed")?;
+                self.limits.drop_request_on_err(check_outputs(
+                    proof.public_values.as_slice(),
+                    head,
+                    p.latest_block,
+                    client.config.chain.genesis_root,
+                    trusted_committee,
+                ))?;
+                self.limits.drop_request_on_err(
+                    self.client
+                        .verify(&proof, self.lightclient_pk.verifying_key(), None)
+                        .context("Local verification of the resumed proof failed"),
+                )?;
                 return Ok(Some(proof));
             }
         }
@@ -525,9 +544,11 @@ impl MagiZkProver {
         proof.public_values = public_values;
         // Verify locally before publishing: catches any divergence between the
         // executed public values and what the prover bound into the SNARK.
-        self.client
-            .verify(&proof, self.lightclient_pk.verifying_key(), None)
-            .context("Local proof verification failed after public values splice")?;
+        self.limits.drop_request_on_err(
+            self.client
+                .verify(&proof, self.lightclient_pk.verifying_key(), None)
+                .context("Local proof verification failed after public values splice"),
+        )?;
 
         info!("Proof generated for slot {latest_block}");
         Ok(Some(proof))

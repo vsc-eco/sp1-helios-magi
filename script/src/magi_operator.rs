@@ -417,4 +417,21 @@ mod tests {
         assert_eq!(NetworkLimits::default().max_price_per_pgu, 300_000_000, "0.3 PROVE per billion PGU");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn a_fulfilled_proof_that_fails_its_checks_is_not_resumed() {
+        use crate::magi_prover::{NetworkLimits, PendingRequest};
+        let dir = std::env::temp_dir().join(format!("magi-req-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = NetworkLimits { request_file: Some(dir.join("req.json")), ..Default::default() };
+        let r = PendingRequest { request_id: B256::repeat_byte(9), head: 8224, latest_block: 8256 };
+        l.save_request(&r).unwrap();
+        // A passing check keeps the request (it lands, then clear_request).
+        assert_eq!(l.drop_request_on_err(Ok(1u8)).unwrap(), 1);
+        assert_eq!(l.load_request().unwrap(), Some(r));
+        // A failing one drops it: resuming the same proof can never pass.
+        assert!(l.drop_request_on_err::<()>(Err(anyhow::anyhow!("local verify failed"))).is_err());
+        assert_eq!(l.load_request().unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
