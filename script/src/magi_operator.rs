@@ -98,6 +98,104 @@ pub fn backoff(idle: Duration, failures: u32) -> Duration {
     idle.saturating_mul(factor).min(Duration::from_secs(3600))
 }
 
+/// A10: the window --max-proofs-per-day counts paid proofs over.
+pub const BUDGET_WINDOW_SECS: u64 = 86_400;
+
+/// A10: when each proof of the last day was paid (unix seconds), kept in a
+/// file so a restart does not reset the daily budget. Anyone who can make the
+/// bot want proofs spends PROVE; the budget bounds what a day can cost, and the
+/// bot's want-proof alarm reports the wait it causes.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProofLedger {
+    pub paid: Vec<u64>,
+}
+
+impl ProofLedger {
+    /// A missing file is an empty ledger.
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).with_context(|| format!("{} is not a proof ledger", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self)?).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))
+    }
+
+    /// Records the proofs paid during a step (the paid counter went from
+    /// before to after) at now; whether there were any.
+    pub fn record_paid(&mut self, before: u64, after: u64, now: u64) -> bool {
+        if after <= before {
+            return false;
+        }
+        self.record(now, after - before);
+        true
+    }
+
+    /// Records n proofs paid at now and forgets those outside the window.
+    pub fn record(&mut self, now: u64, n: u64) {
+        self.paid.extend(std::iter::repeat(now).take(n as usize));
+        self.paid.retain(|&t| now.saturating_sub(t) < BUDGET_WINDOW_SECS);
+    }
+
+    /// Proofs paid in the window ending at now.
+    pub fn paid_in_window(&self, now: u64) -> u64 {
+        self.paid.iter().filter(|&&t| now.saturating_sub(t) < BUDGET_WINDOW_SECS).count() as u64
+    }
+
+    /// None when another paid proof fits a budget of per_day; else the unix
+    /// time the oldest counted proof leaves the window.
+    pub fn next_free(&self, now: u64, per_day: u64) -> Option<u64> {
+        if self.paid_in_window(now) < per_day {
+            return None;
+        }
+        let oldest = self.paid.iter().filter(|&&t| now.saturating_sub(t) < BUDGET_WINDOW_SECS).min().copied().unwrap_or(now);
+        Some(oldest + BUDGET_WINDOW_SECS)
+    }
+}
+
+/// A10: what the proof budgets allow the next step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budgets {
+    /// --max-proofs is not reached (once it is, the operator stops).
+    pub lifetime_left: bool,
+    /// The daily budget is spent until this unix time (a wanted proof waits).
+    pub daily_next: Option<u64>,
+}
+
+impl Budgets {
+    pub fn at(max_proofs: Option<u64>, paid: u64, per_day: Option<u64>, ledger: &ProofLedger, now: u64) -> Self {
+        Self {
+            lifetime_left: max_proofs.map_or(true, |max| paid < max),
+            daily_next: per_day.and_then(|max| ledger.next_free(now, max)),
+        }
+    }
+
+    pub fn may_prove(&self) -> bool {
+        self.lifetime_left && self.daily_next.is_none()
+    }
+}
+
+/// A10: one PROVE in PROVE wei.
+const PROVE_WEI: u128 = 1_000_000_000_000_000_000;
+
+/// Whether a Prover Network balance (PROVE wei) is under the alarm, in whole
+/// PROVE. An alarm of 0 never fires.
+pub fn prove_low(balance: alloy_primitives::U256, alarm_prove: u64) -> bool {
+    balance < alloy_primitives::U256::from(alarm_prove as u128 * PROVE_WEI)
+}
+
+/// A PROVE wei amount as PROVE with 4 decimals, rounded down.
+pub fn fmt_prove(wei: alloy_primitives::U256) -> String {
+    let unit = alloy_primitives::U256::from(PROVE_WEI);
+    let frac = (wei % unit) / alloy_primitives::U256::from(PROVE_WEI / 10_000);
+    format!("{}.{:04} PROVE", wei / unit, frac.to::<u64>())
+}
+
 /// Parses the verifier state read with `STATE_KEYS`. A missing key reads as
 /// null or "" on Magi.
 pub fn parse_verifier_state(state: &HashMap<String, Option<String>>) -> Result<VerifierState> {
@@ -423,6 +521,69 @@ mod tests {
         assert_eq!(backoff(m, 1000), Duration::from_secs(3600));
         assert_eq!(backoff(Duration::from_secs(10), 7), Duration::from_secs(640));
         assert_eq!(backoff(Duration::MAX, 3), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn the_daily_budget_counts_the_last_24_hours() {
+        let day = BUDGET_WINDOW_SECS;
+        let mut l = ProofLedger::default();
+        assert_eq!(l.next_free(1_000_000, 3), None);
+        l.record(1_000_000, 2);
+        l.record(1_000_100, 1);
+        assert_eq!(l.paid_in_window(1_000_100), 3);
+        assert_eq!(l.next_free(1_000_100, 3), Some(1_000_000 + day), "the oldest proof frees a slot a day after it was paid");
+        assert_eq!(l.next_free(1_000_100, 4), None);
+        assert_eq!(l.next_free(1_000_000 + day - 1, 3), Some(1_000_000 + day));
+        assert_eq!(l.next_free(1_000_000 + day, 3), None, "both proofs paid at 1,000,000 have left the window");
+        l.record(1_000_000 + day, 1);
+        assert_eq!(l.paid, vec![1_000_100, 1_000_000 + day], "recording forgets proofs outside the window");
+    }
+
+    #[test]
+    fn either_budget_stops_paid_proofs() {
+        let mut l = ProofLedger::default();
+        assert!(!l.record_paid(3, 3, 100), "nothing paid during the step");
+        assert!(l.paid.is_empty());
+        assert!(l.record_paid(3, 5, 100));
+        assert_eq!(l.paid, vec![100, 100]);
+        let b = Budgets::at(None, 5, None, &l, 200);
+        assert!(b.may_prove(), "no budget set");
+        let b = Budgets::at(Some(5), 5, None, &l, 200);
+        assert_eq!(b, Budgets { lifetime_left: false, daily_next: None });
+        assert!(!b.may_prove());
+        let b = Budgets::at(Some(6), 5, Some(2), &l, 200);
+        assert_eq!(b, Budgets { lifetime_left: true, daily_next: Some(100 + BUDGET_WINDOW_SECS) });
+        assert!(!b.may_prove(), "the daily budget alone stops a paid proof");
+        assert!(Budgets::at(Some(6), 5, Some(3), &l, 200).may_prove());
+        assert!(Budgets::at(None, 5, Some(2), &l, 100 + BUDGET_WINDOW_SECS).may_prove(), "a day later the slots are free");
+    }
+
+    #[test]
+    fn the_ledger_survives_a_restart() {
+        let path = std::env::temp_dir().join(format!("magi-ledger-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ProofLedger::load(&path).unwrap(), ProofLedger::default(), "no file: nothing paid yet");
+        let mut l = ProofLedger::default();
+        l.record(5_000, 2);
+        l.save(&path).unwrap();
+        let back = ProofLedger::load(&path).unwrap();
+        assert_eq!(back.next_free(5_001, 2), Some(5_000 + BUDGET_WINDOW_SECS));
+        std::fs::write(&path, b"{").unwrap();
+        assert!(ProofLedger::load(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_prove_alarm_fires_under_its_threshold() {
+        use alloy_primitives::U256;
+        let prove = |n: u128| U256::from(n * PROVE_WEI);
+        assert!(prove_low(prove(24), 25));
+        assert!(prove_low(prove(25) - U256::from(1), 25));
+        assert!(!prove_low(prove(25), 25));
+        assert!(!prove_low(U256::ZERO, 0), "0 turns the alarm off");
+        assert_eq!(fmt_prove(prove(25)), "25.0000 PROVE");
+        assert_eq!(fmt_prove(U256::from(1_234_567_000_000_000_000u128)), "1.2345 PROVE");
+        assert_eq!(fmt_prove(U256::from(99_999_999_999_999u128)), "0.0000 PROVE");
     }
 
     #[test]

@@ -557,6 +557,11 @@ impl MagiZkProver {
     pub fn lightclient_vkey(&self) -> String {
         self.lightclient_pk.verifying_key().bytes32()
     }
+
+    /// A10: the requester's balance on the Prover Network, in PROVE wei.
+    pub async fn prove_balance(&self) -> Result<U256> {
+        self.client.get_balance().await
+    }
 }
 
 /// The executed public values must continue the verifier: start at its beacon

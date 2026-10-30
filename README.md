@@ -89,6 +89,8 @@ On demand: with `--needs-file` (the bot's `NEEDS_FILE`, on the same host) it pro
 
 Every proof is paid on the Prover Network. Each request carries a price cap and deadlines: `SP1_MAX_PRICE_PER_PGU` (PROVE wei per PGU, default 300000000 = 0.3 PROVE per billion PGU; a light-client update is ~53-72M PGU), `SP1_PROOF_TIMEOUT_SECS` (1800) and `SP1_AUCTION_TIMEOUT_SECS` (120). The request id is saved to `MAGI_PROOF_REQUEST_FILE` (default `magi-proof-request.json`) before waiting, so a restart resumes a paid request instead of buying another. `--max-proofs N` stops the operator once it has been sent N proofs (counted when the network returns one, so a proof that then fails to land still counts); `--max-proofs 1` is a single paid proof, for a first run.
 
+Anyone who makes the bot want proofs (a deposit or a waiting withdrawal) spends the operator's PROVE, so two limits bound it (A10). `--max-proofs-per-day N` pays for at most N proofs in any 24 hours; the times are kept in `MAGI_PROOF_LEDGER_FILE` (default `magi-proof-ledger.json`) so a restart does not reset the count. A wanted proof past the budget waits, with an error logged, and confirmations and new maps wait with it (the bot's /health raises its want-proof alarm after 6 h), so size N above a busy day: the batch window allows at most 144 on-demand proofs a day. `--low-prove-alarm` (default 25 PROVE, 0 off) logs an error when the Prover Network balance is under it, checked at start and after each paid proof. Fee income from `setProofFee` reaches the operator as a Magi balance; turning it into PROVE is a manual step.
+
 ## Validation
 
 The recorded Plataberget fixtures contain signed Gloas updates, execution headers, and source storage proofs.
