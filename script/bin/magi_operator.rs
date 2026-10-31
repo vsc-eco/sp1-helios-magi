@@ -192,8 +192,15 @@ async fn main() -> Result<()> {
         };
         let paid_now = operator.proofs_paid.load(std::sync::atomic::Ordering::SeqCst);
         if ledger.record_paid(paid, paid_now, unix_now()) {
-            if let Err(e) = ledger.save(&ledger_file) {
-                error!("A10: {e:#}");
+            match ledger.save(&ledger_file) {
+                // Only once the payment is on disk: a resume of the same request
+                // (a failed submit, a restart) then does not count it again.
+                Ok(()) => {
+                    if let Err(e) = operator.prover.limits.mark_request_counted() {
+                        error!("A10: {e:#}");
+                    }
+                }
+                Err(e) => error!("A10: {e:#}"),
             }
             check_prove_balance(&operator, args.low_prove_alarm).await;
         }

@@ -279,6 +279,18 @@ pub struct PendingRequest {
     pub head: u64,
     /// The finalized slot it proves.
     pub latest_block: u64,
+    /// Its proof was received and recorded in the daily proof ledger (A10).
+    /// A resumed request with this set is not counted again (absent in files
+    /// written before this field: counted on resume, as before).
+    #[serde(default)]
+    pub counted: bool,
+}
+
+/// A10: whether receiving a resumed request's proof is a payment to count:
+/// once per request. A resume after the ledger recorded it (a failed submit, a
+/// restart) is not a new payment.
+pub fn resume_counts(p: &PendingRequest) -> bool {
+    !p.counted
 }
 
 impl NetworkLimits {
@@ -301,6 +313,17 @@ impl NetworkLimits {
     pub fn clear_request(&self) {
         if let Some(path) = &self.request_file {
             let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A10: marks the saved request as recorded in the proof ledger, once the
+    /// ledger holding its payment is on disk. A restart before that resumes it
+    /// uncounted, so the payment is still recorded; after it, a resume (a failed
+    /// submit, a restart) no longer records the same payment again.
+    pub fn mark_request_counted(&self) -> Result<()> {
+        match self.load_request()? {
+            Some(r) if !r.counted => self.save_request(&PendingRequest { counted: true, ..r }),
+            _ => Ok(()),
         }
     }
 
@@ -408,7 +431,9 @@ impl MagiZkProver {
                         return Err(e).context("the resumed Prover Network request failed; a new one is requested next step");
                     }
                 };
-                paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if resume_counts(&p) {
+                    paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 self.limits.drop_request_on_err(check_outputs(
                     proof.public_values.as_slice(),
                     head,
@@ -521,7 +546,7 @@ impl MagiZkProver {
             .request()
             .await
             .context("Prover Network request failed")?;
-        self.limits.save_request(&PendingRequest { request_id, head, latest_block })?;
+        self.limits.save_request(&PendingRequest { request_id, head, latest_block, counted: false })?;
         info!(
             "Prover Network request {request_id} (max {} PROVE wei/PGU, deadline {:?})",
             self.limits.max_price_per_pgu, self.limits.proof_timeout

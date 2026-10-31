@@ -639,14 +639,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let l = NetworkLimits { request_file: Some(dir.join("req.json")), ..Default::default() };
         assert_eq!(l.load_request().unwrap(), None);
-        let r = PendingRequest { request_id: B256::repeat_byte(7), head: 8224, latest_block: 8256 };
+        let r = PendingRequest { request_id: B256::repeat_byte(7), head: 8224, latest_block: 8256, counted: false };
         l.save_request(&r).unwrap();
         assert_eq!(l.load_request().unwrap(), Some(r));
         l.clear_request();
         assert_eq!(l.load_request().unwrap(), None);
         // No file configured: nothing is kept.
         let none = NetworkLimits::default();
-        none.save_request(&PendingRequest { request_id: B256::ZERO, head: 1, latest_block: 2 }).unwrap();
+        none.save_request(&PendingRequest { request_id: B256::ZERO, head: 1, latest_block: 2, counted: false }).unwrap();
         assert_eq!(none.load_request().unwrap(), None);
         assert_eq!(NetworkLimits::default().max_price_per_pgu, 300_000_000, "0.3 PROVE per billion PGU");
         let _ = std::fs::remove_dir_all(dir);
@@ -658,7 +658,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("magi-req-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let l = NetworkLimits { request_file: Some(dir.join("req.json")), ..Default::default() };
-        let r = PendingRequest { request_id: B256::repeat_byte(9), head: 8224, latest_block: 8256 };
+        let r = PendingRequest { request_id: B256::repeat_byte(9), head: 8224, latest_block: 8256, counted: false };
         l.save_request(&r).unwrap();
         // A passing check keeps the request (it lands, then clear_request).
         assert_eq!(l.drop_request_on_err(Ok(1u8)).unwrap(), 1);
@@ -667,5 +667,56 @@ mod tests {
         assert!(l.drop_request_on_err::<()>(Err(anyhow::anyhow!("local verify failed"))).is_err());
         assert_eq!(l.load_request().unwrap(), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_resumed_request_is_counted_once() {
+        // Testnet 2026-10-31: a proof received, its submit refused (RC), then
+        // resumed twice (next step, a restart): the daily ledger counted one
+        // payment three times and refused the next proof a withdrawal needed.
+        use crate::magi_prover::{resume_counts, NetworkLimits, PendingRequest};
+        let dir = std::env::temp_dir().join(format!("magi-req-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger_file = dir.join("ledger.json");
+        let l = NetworkLimits { request_file: Some(dir.join("req.json")), ..Default::default() };
+        let mut ledger = ProofLedger::default();
+        let now = 1_793_412_509;
+        // Step 1: a new request, its proof received (paid 0 -> 1), recorded,
+        // then marked once the ledger is on disk (as the operator loop does).
+        l.save_request(&PendingRequest { request_id: B256::repeat_byte(5), head: 8224, latest_block: 8256, counted: false }).unwrap();
+        assert!(ledger.record_paid(0, 1, now));
+        ledger.save(&ledger_file).unwrap();
+        l.mark_request_counted().unwrap();
+        // Step 2 and a restart: the same request resumed is not a new payment.
+        for paid_before in [1u64, 0] {
+            let p = l.load_request().unwrap().unwrap();
+            let paid_after = paid_before + u64::from(resume_counts(&p));
+            assert!(!ledger.record_paid(paid_before, paid_after, now + 64));
+        }
+        assert_eq!(ProofLedger::load(&ledger_file).unwrap().paid_in_window(now + 64), 1);
+        // Marking twice changes nothing; with nothing saved it is a no-op.
+        l.mark_request_counted().unwrap();
+        assert!(l.load_request().unwrap().unwrap().counted);
+        l.clear_request();
+        l.mark_request_counted().unwrap();
+        assert_eq!(l.load_request().unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_killed_before_its_ledger_write_is_still_counted() {
+        // Killed after the proof arrived but before the ledger reached disk:
+        // the saved request is unmarked, so the resume records the payment.
+        use crate::magi_prover::{resume_counts, PendingRequest};
+        let p = PendingRequest { request_id: B256::repeat_byte(6), head: 8224, latest_block: 8256, counted: false };
+        assert!(resume_counts(&p));
+        assert!(!resume_counts(&PendingRequest { counted: true, ..p }));
+        // A request file from before this field resumes uncounted, as before.
+        let old: PendingRequest = serde_json::from_str(&format!(
+            r#"{{"request_id":"{}","head":8224,"latest_block":8256}}"#,
+            B256::repeat_byte(6)
+        ))
+        .unwrap();
+        assert!(resume_counts(&old));
     }
 }
