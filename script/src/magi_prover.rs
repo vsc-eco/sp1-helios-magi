@@ -21,10 +21,12 @@ use sp1_sdk::{
     ProvingKey, SP1ProofMode, SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin,
 };
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use tree_hash::TreeHash;
 
 /// Z-PR-M4 (MED #41): bound the ELF-pin GraphQL call.
 ///
@@ -217,7 +219,105 @@ async fn verify_elf_hash(cfg: &ElfPinConfig) {
     }
 }
 
+/// RP-2 / RP-10: what one Prover Network request may cost and take, and where
+/// its id is kept so a restart resumes it instead of paying for another.
+#[derive(Debug, Clone)]
+pub struct NetworkLimits {
+    /// Highest price per PGU, in PROVE wei (auction). Default 0.3 PROVE per
+    /// billion PGU, op-succinct's default; a light-client update is ~53-72M PGU.
+    pub max_price_per_pgu: u64,
+    /// The request's deadline on the network, and how long the operator waits.
+    pub proof_timeout: Duration,
+    /// A request no prover picks up within this is cancelled (auction).
+    pub auction_timeout: Duration,
+    /// RP-10: the pending request id is written here before waiting.
+    pub request_file: Option<PathBuf>,
+}
+
+impl Default for NetworkLimits {
+    fn default() -> Self {
+        Self {
+            max_price_per_pgu: 300_000_000,
+            proof_timeout: Duration::from_secs(1800),
+            auction_timeout: Duration::from_secs(120),
+            request_file: None,
+        }
+    }
+}
+
+/// `NetworkLimits` from SP1_MAX_PRICE_PER_PGU (PROVE wei), SP1_PROOF_TIMEOUT_SECS,
+/// SP1_AUCTION_TIMEOUT_SECS and MAGI_PROOF_REQUEST_FILE; unset ones default.
+pub fn network_limits_from_env() -> Result<NetworkLimits> {
+    let mut l = NetworkLimits::default();
+    let num = |k: &str| -> Result<Option<u64>> {
+        match std::env::var(k) {
+            Ok(v) => Ok(Some(v.trim().parse::<u64>().with_context(|| format!("{k}={v:?} is not a number"))?)),
+            Err(_) => Ok(None),
+        }
+    };
+    if let Some(v) = num("SP1_MAX_PRICE_PER_PGU")? {
+        anyhow::ensure!(v > 0, "SP1_MAX_PRICE_PER_PGU must be positive");
+        l.max_price_per_pgu = v;
+    }
+    if let Some(v) = num("SP1_PROOF_TIMEOUT_SECS")? {
+        l.proof_timeout = Duration::from_secs(v);
+    }
+    if let Some(v) = num("SP1_AUCTION_TIMEOUT_SECS")? {
+        l.auction_timeout = Duration::from_secs(v);
+    }
+    if let Ok(p) = std::env::var("MAGI_PROOF_REQUEST_FILE") {
+        l.request_file = Some(PathBuf::from(p));
+    }
+    Ok(l)
+}
+
+/// A Prover Network request this operator paid to start (RP-10).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRequest {
+    pub request_id: B256,
+    /// The verifier beacon head the proof starts from.
+    pub head: u64,
+    /// The finalized slot it proves.
+    pub latest_block: u64,
+}
+
+impl NetworkLimits {
+    pub fn load_request(&self) -> Result<Option<PendingRequest>> {
+        let Some(path) = &self.request_file else { return Ok(None) };
+        match std::fs::read(path) {
+            Ok(b) => Ok(Some(serde_json::from_slice(&b).with_context(|| format!("{} is not a pending request", path.display()))?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn save_request(&self, r: &PendingRequest) -> Result<()> {
+        let Some(path) = &self.request_file else { return Ok(()) };
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(r)?).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))
+    }
+
+    pub fn clear_request(&self) {
+        if let Some(path) = &self.request_file {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A fulfilled proof that fails its checks (local verify, the outputs the
+    /// verifier requires) cannot pass by waiting: its saved request is dropped,
+    /// so the next step requests a new proof instead of resuming this one
+    /// forever (RP-10 resumes only a request that can still land).
+    pub fn drop_request_on_err<T>(&self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.clear_request();
+        }
+        r
+    }
+}
+
 pub struct MagiZkProver {
+    pub limits: NetworkLimits,
     client: Arc<NetworkProver>,
     lightclient_pk: Arc<SP1ProvingKey>,
     source_execution_rpc: ExecutionRpc,
@@ -268,6 +368,7 @@ impl MagiZkProver {
             .await
             .context("Failed to setup light client")?;
         Ok(Self {
+            limits: NetworkLimits::default(),
             client: Arc::new(client),
             lightclient_pk: Arc::new(lightclient_pk),
             source_execution_rpc,
@@ -288,6 +389,41 @@ impl MagiZkProver {
         trusted_committee: B256,
         paid: &std::sync::atomic::AtomicU64,
     ) -> Result<Option<SP1ProofWithPublicValues>> {
+        // RP-10: a request this operator already paid for (it crashed or
+        // restarted while waiting) is resumed, not requested again.
+        if let Some(p) = self.limits.load_request()? {
+            if p.head != head {
+                info!("RP-10: dropping the saved request for slot {} (the verifier is at {head})", p.head);
+                self.limits.clear_request();
+            } else {
+                info!("RP-10: resuming Prover Network request {} (slot {head} -> {})", p.request_id, p.latest_block);
+                let proof = match self
+                    .client
+                    .wait_proof(p.request_id, Some(self.limits.proof_timeout), Some(self.limits.auction_timeout))
+                    .await
+                {
+                    Ok(proof) => proof,
+                    Err(e) => {
+                        self.limits.clear_request();
+                        return Err(e).context("the resumed Prover Network request failed; a new one is requested next step");
+                    }
+                };
+                paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.limits.drop_request_on_err(check_outputs(
+                    proof.public_values.as_slice(),
+                    head,
+                    p.latest_block,
+                    client.config.chain.genesis_root,
+                    trusted_committee,
+                ))?;
+                self.limits.drop_request_on_err(
+                    self.client
+                        .verify(&proof, self.lightclient_pk.verifying_key(), None)
+                        .context("Local verification of the resumed proof failed"),
+                )?;
+                return Ok(Some(proof));
+            }
+        }
         let updates = get_updates(client).await?;
         // CRIT #23: the client must be configured for this prover's chain id.
         // magi_operator builds both from --source-chain-id, so there this only
@@ -327,6 +463,19 @@ impl MagiZkProver {
                 "bootstrapped store is at slot {store_slot}, not the verifier's beacon head {head}; not proving"
             );
         }
+        // BOOTSTRAP-1: the proven checkpoint becomes the verifier's head, and the
+        // next proof bootstraps the light client there. Some finalized
+        // checkpoints have no light-client bootstrap on any public beacon API
+        // (phase C3, Sepolia epochs 357882-357883): a proof landing on one stops
+        // every later proof. Prove only to a checkpoint whose bootstrap is
+        // served; otherwise wait for the next finality update (~6.4 min).
+        let target_root = finality_update.finalized_header().beacon().tree_hash_root();
+        if let Err(e) = <HttpRpc as ConsensusRpc<MainnetConsensusSpec>>::get_bootstrap(&client.rpc, target_root).await {
+            info!(
+                "BOOTSTRAP-1: no light-client bootstrap for the target checkpoint (slot {latest_block}, root {target_root}): {e}; waiting for the next finality update"
+            );
+            return Ok(None);
+        }
         info!("Proving update from slot {head} to {latest_block}");
 
         let mut inputs = ProofInputs {
@@ -358,22 +507,48 @@ impl MagiZkProver {
         // The executed outputs are what the proof will commit: check them
         // against what the verifier requires before paying for the proof.
         check_outputs(public_values.as_slice(), head, latest_block, client.config.chain.genesis_root, trusted_committee)?;
-        let mut proof = self
+        // RP-2: a price cap and deadlines (the request had none: a stuck or
+        // expensive auction would hold the bridge's headers or overspend).
+        // RP-10: request, save the id, then wait.
+        let request_id = self
             .client
             .prove(&self.lightclient_pk, prove_stdin)
             .mode(SP1ProofMode::Groth16)
             .strategy(self.fulfillment_strategy)
+            .max_price_per_pgu(self.limits.max_price_per_pgu)
+            .timeout(self.limits.proof_timeout)
+            .auction_timeout(self.limits.auction_timeout)
+            .request()
             .await
-            .context("Groth16 proving failed")?;
+            .context("Prover Network request failed")?;
+        self.limits.save_request(&PendingRequest { request_id, head, latest_block })?;
+        info!(
+            "Prover Network request {request_id} (max {} PROVE wei/PGU, deadline {:?})",
+            self.limits.max_price_per_pgu, self.limits.proof_timeout
+        );
+        let mut proof = match self
+            .client
+            .wait_proof(request_id, Some(self.limits.proof_timeout), Some(self.limits.auction_timeout))
+            .await
+        {
+            Ok(proof) => proof,
+            Err(e) => {
+                // Past its deadline or cancelled: it cannot be fulfilled (or charged).
+                self.limits.clear_request();
+                return Err(e).context("Groth16 proving failed");
+            }
+        };
         // Paid from here on, whatever happens next (a failed local verify
         // below still cost a proof, and --max-proofs must count it).
         paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         proof.public_values = public_values;
         // Verify locally before publishing: catches any divergence between the
         // executed public values and what the prover bound into the SNARK.
-        self.client
-            .verify(&proof, self.lightclient_pk.verifying_key(), None)
-            .context("Local proof verification failed after public values splice")?;
+        self.limits.drop_request_on_err(
+            self.client
+                .verify(&proof, self.lightclient_pk.verifying_key(), None)
+                .context("Local proof verification failed after public values splice"),
+        )?;
 
         info!("Proof generated for slot {latest_block}");
         Ok(Some(proof))
@@ -381,6 +556,11 @@ impl MagiZkProver {
 
     pub fn lightclient_vkey(&self) -> String {
         self.lightclient_pk.verifying_key().bytes32()
+    }
+
+    /// A10: the requester's balance on the Prover Network, in PROVE wei.
+    pub async fn prove_balance(&self) -> Result<U256> {
+        self.client.get_balance().await
     }
 }
 

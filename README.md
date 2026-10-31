@@ -36,7 +36,7 @@ Beacon Chain (Consensus Layer)
 - `ProofOutputs` adds `executionBlockHash` (the verifier keccak-checks each submitted RLP header against it) and `genesisRoot` (ABI slot 10, `pvBytes[352:384]`; chain identity, pinned by the verifier). There is no committed `chainId`.
 - "No next sync committee" is committed as `0xFF..FF`, never `ZERO`, so it can not match uninitialized storage (MED Z-PR-M1). Upstream's #54 reset of `store.next_sync_committee` is kept.
 - `magi_prover.rs`: Groth16 only; the consensus client must be configured for the expected chain id (CRIT #23; a consensus RPC serving another chain is caught in-circuit, where the committee signatures are checked under the configured genesis root, and by the verifier's genesis-root and committee anchoring); at startup the local ELF hash must match the verifier's `elfhash` pin (HIGH #22). Before paying for a proof it checks, for free, that the bootstrapped store is at the verifier's beacon head and that the executed outputs continue it (`prevHead`, `newHead`, `genesisRoot`).
-- `magi_submitter.rs` / `magi_operator.rs`: submit proofs and header batches to the zk-header-verifier on Magi, sized under the node's 8192-byte payload cap, and backfill a header gap right after each proof.
+- `magi_submitter.rs` / `magi_operator.rs`: submit each proof to the zk-header-verifier on Magi with the proven block's header (the verifier stores other headers on demand, RP-9), proving on demand from the bridge bot's needs file.
 - `script/build.rs` builds the guest programs in the `ghcr.io/succinctlabs/sp1:v6.8.1` image pinned by digest; `.github/workflows/elf-reproducibility.yml` fails a PR whose committed ELFs differ from that build.
 
 Upstream's `operator` / `genesis` binaries are not part of the Magi path: they target upstream's Solidity contract and its `ProofOutputs` layout, and are not built. Not carried from upstream: that contract (`contracts/`, with its `sp1-contracts` submodule), its book, its audit reports (they cover upstream's code, not this fork's changes), its agent files, its CI workflows and its operator `Dockerfile`. CI here is the ELF reproducibility check, with every third-party action pinned by commit.
@@ -79,12 +79,17 @@ cargo run --release --bin magi_operator -- \
   --source-execution-rpc "$SOURCE_EXECUTION_RPC_URL" \
   --magi-graphql "$MAGI_GRAPHQL_URL" \
   --verifier-contract "$ZK_HEADER_VERIFIER_ID" \
-  --net-id vsc-testnet
+  --net-id vsc-testnet \
+  --needs-file /var/lib/evm-bot/needs.json
 ```
 
-Each step proves the next finalized update and submits it, then backfills the headers the verifier is missing; it waits for every call to show in the verifier state before the next one. It proves only when the verifier's program vkey (`sp1vk`) is this ELF's (a proof for another vkey would be refused on chain but still paid for), and after a failed step it waits twice as long each time, up to an hour.
+Each step proves the latest finalized update and submits it with the proven block's header; it waits for the call to show in the verifier state before the next one. Nothing is backfilled: the bridge bot stores the other headers it needs (EIP-2935 attestation, or linked down by parent hash). It proves only when the verifier's program vkey (`sp1vk`) is this ELF's (a proof for another vkey would be refused on chain but still paid for), and after a failed step it waits twice as long each time, up to an hour.
 
-Every proof is paid on the Prover Network. `--max-proofs N` stops the operator once it has been sent N proofs (counted when the network returns one, so a proof that then fails to land still counts) and the header gap they opened is backfilled; `--max-proofs 1` is a single paid proof, for a first run.
+On demand: with `--needs-file` (the bot's `NEEDS_FILE`, on the same host) it proves only while the bot wants a proof (a deposit or withdrawal block above the proven tip, or withdrawals waiting on a tip header older than 45 min), once the request has waited `--batch-window-mins` (default 10) so one proof covers what arrives meanwhile, and not at all while the file goes `--needs-stale-mins` (15) without an update (the bot is down). An idle bridge costs nothing. Without `--needs-file` it proves every new checkpoint.
+
+Every proof is paid on the Prover Network. Each request carries a price cap and deadlines: `SP1_MAX_PRICE_PER_PGU` (PROVE wei per PGU, default 300000000 = 0.3 PROVE per billion PGU; a light-client update is ~53-72M PGU), `SP1_PROOF_TIMEOUT_SECS` (1800) and `SP1_AUCTION_TIMEOUT_SECS` (120). The request id is saved to `MAGI_PROOF_REQUEST_FILE` (default `magi-proof-request.json`) before waiting, so a restart resumes a paid request instead of buying another. `--max-proofs N` stops the operator once it has been sent N proofs (counted when the network returns one, so a proof that then fails to land still counts); `--max-proofs 1` is a single paid proof, for a first run.
+
+Anyone who makes the bot want proofs (a deposit or a waiting withdrawal) spends the operator's PROVE, so two limits bound it (A10). `--max-proofs-per-day N` pays for at most N proofs in any 24 hours; the times are kept in `MAGI_PROOF_LEDGER_FILE` (default `magi-proof-ledger.json`) so a restart does not reset the count. A wanted proof past the budget waits, with an error logged, and confirmations and new maps wait with it (the bot's /health raises its want-proof alarm after 6 h), so size N above a busy day: the batch window allows at most 144 on-demand proofs a day. `--low-prove-alarm` (default 25 PROVE, 0 off) logs an error when the Prover Network balance is under it, checked at start and after each paid proof. Fee income from `setProofFee` reaches the operator as a Magi balance; turning it into PROVE is a manual step.
 
 ## Validation
 
