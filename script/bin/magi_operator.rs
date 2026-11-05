@@ -8,7 +8,7 @@
 //! header costs a few k RC; nothing is backfilled (RP-9).
 //!
 //! Prover Network limits (RP-2) come from SP1_MAX_PRICE_PER_PGU (PROVE wei per
-//! PGU, default 0.3 PROVE per billion), SP1_PROOF_TIMEOUT_SECS (1800) and
+//! PGU, default 0.3 PROVE per billion), SP1_PROOF_TIMEOUT_SECS (600) and
 //! SP1_AUCTION_TIMEOUT_SECS (120); the pending request id is kept in
 //! MAGI_PROOF_REQUEST_FILE (RP-10, default magi-proof-request.json). A10: the
 //! times proofs were paid are kept in MAGI_PROOF_LEDGER_FILE (default
@@ -19,7 +19,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
 use sp1_helios_script::execution::ExecutionRpc;
-use sp1_helios_script::magi_operator::{backoff, fmt_prove, prove_low, Budgets, MagiOperator, ProofLedger, Step};
+use sp1_helios_script::magi_operator::{backoff, budget_warning, fmt_prove, prove_low, Budgets, MagiOperator, ProofLedger, Step};
 use sp1_helios_script::magi_prover::{network_limits_from_env, prover_settings_from_env, ElfPinConfig, MagiZkProver};
 use sp1_helios_script::magi_submitter::MagiSubmitterConfig;
 use std::time::Duration;
@@ -177,6 +177,9 @@ async fn main() -> Result<()> {
             ledger.paid_in_window(unix_now()),
             ledger_file.display()
         );
+        if let Some(w) = budget_warning(ledger.paid_in_window(unix_now()), args.max_proofs_per_day) {
+            warn!("{w}");
+        }
     }
     check_prove_balance(&operator, args.low_prove_alarm).await;
     let mut budget_logged_until = 0u64;
@@ -201,6 +204,10 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => error!("A10: {e:#}"),
+            }
+            // I-30: warn while there is still budget left, not only once it is spent.
+            if let Some(w) = budget_warning(ledger.paid_in_window(unix_now()), args.max_proofs_per_day) {
+                warn!("{w}");
             }
             check_prove_balance(&operator, args.low_prove_alarm).await;
         }

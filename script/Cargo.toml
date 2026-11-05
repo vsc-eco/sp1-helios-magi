@@ -50,6 +50,13 @@ hex = { workspace = true }
 [build-dependencies]
 sp1-build = { workspace = true }
 
+[dev-dependencies]
+# I-35 test only: an HTTP/2 server behind a relay (versions already in Cargo.lock).
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
 [[bin]]
 name = "benchmark"
 path = "bin/benchmark.rs"
