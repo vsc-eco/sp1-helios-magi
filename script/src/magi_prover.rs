@@ -238,7 +238,11 @@ impl Default for NetworkLimits {
     fn default() -> Self {
         Self {
             max_price_per_pgu: 300_000_000,
-            proof_timeout: Duration::from_secs(1800),
+            // I-27 (testnet 11-04): a request a prover took and never
+            // fulfilled blocked all proving for this whole deadline (10:22:59
+            // to 10:52:03, 1,800 s); the 14 that landed that day took 23-85 s
+            // from assignment, the retry 23 s. 600 s keeps 7x the slowest.
+            proof_timeout: Duration::from_secs(600),
             auction_timeout: Duration::from_secs(120),
             request_file: None,
         }

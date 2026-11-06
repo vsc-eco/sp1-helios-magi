@@ -19,6 +19,21 @@ use sp1_helios_primitives::{
     verify_storage_slot_proofs,
 };
 
+/// HTTP/2 health checks on the execution RPC's pooled connection (I-35,
+/// testnet 11-05 ~01:22-01:38: an established HTTP/2 connection to the RPC went
+/// silent, no RST or FIN, while new connections worked; without pings every
+/// request was multiplexed onto it and waited out its timeout until TCP gave up,
+/// ~16 minutes). A connection with nothing received for HTTP2_PING_EVERY is
+/// pinged and closed if the ping is not answered within HTTP2_PING_WAIT.
+const HTTP2_PING_EVERY: Duration = Duration::from_secs(15);
+const HTTP2_PING_WAIT: Duration = Duration::from_secs(10);
+
+fn http2_health(b: reqwest::ClientBuilder, every: Duration, wait: Duration) -> reqwest::ClientBuilder {
+    b.http2_keep_alive_interval(every)
+        .http2_keep_alive_timeout(wait)
+        .http2_keep_alive_while_idle(true)
+}
+
 /// Read-only execution RPC for the source chain.
 pub struct ExecutionRpc {
     client: RpcClient,
@@ -28,10 +43,14 @@ impl ExecutionRpc {
     /// Construct a source RPC client with bounded requests.
     pub fn new(url: &str) -> Result<Self> {
         let url = url.parse().context("Invalid source execution RPC URL")?;
-        let client = reqwest::Client::builder()
-            .user_agent("sp1-helios")
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = http2_health(
+            reqwest::Client::builder()
+                .user_agent("sp1-helios")
+                .timeout(Duration::from_secs(30)),
+            HTTP2_PING_EVERY,
+            HTTP2_PING_WAIT,
+        )
+        .build()?;
         Ok(Self {
             client: RpcClient::new_http_with_client(client, url),
         })
@@ -195,6 +214,98 @@ pub async fn fill_execution_header(
 mod tests {
     use super::*;
     use tree_hash::TreeHash;
+
+    /// I-35: a relay in front of an HTTP/2 server freezes the live connection
+    /// (bytes in are dropped, none come out, it is never closed), as a NAT
+    /// that forgot it does; new connections pass. With the health checks the
+    /// client drops the silent connection and the next call is served on a new
+    /// one within a few ping periods.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn i35_a_silent_http2_connection_is_replaced() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // h2c server answering every request with a JSON-RPC result.
+        let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = srv.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(|_req| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(
+                            bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#),
+                        )))
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(hyper_util::rt::TokioIo::new(s), svc)
+                        .await;
+                });
+            }
+        });
+        // The relay; freeze() silences every connection open now.
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let frozen: Arc<Mutex<Vec<Arc<AtomicBool>>>> = Arc::new(Mutex::new(vec![]));
+        let fz = frozen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (c, _) = relay.accept().await.unwrap();
+                let u = TcpStream::connect(srv_addr).await.unwrap();
+                let flag = Arc::new(AtomicBool::new(false));
+                fz.lock().unwrap().push(flag.clone());
+                let (mut cr, mut cw) = c.into_split();
+                let (mut ur, mut uw) = u.into_split();
+                let f1 = flag.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 32 << 10];
+                    while let Ok(n) = cr.read(&mut buf).await {
+                        if n == 0 { break; }
+                        if !f1.load(Ordering::SeqCst) && uw.write_all(&buf[..n]).await.is_err() { break; }
+                    }
+                });
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 32 << 10];
+                    while let Ok(n) = ur.read(&mut buf).await {
+                        if n == 0 { break; }
+                        if !flag.load(Ordering::SeqCst) && cw.write_all(&buf[..n]).await.is_err() { break; }
+                    }
+                });
+            }
+        });
+
+        let client = http2_health(
+            reqwest::Client::builder().timeout(Duration::from_secs(1)).http2_prior_knowledge(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .build()
+        .unwrap();
+        let url = format!("http://{relay_addr}/");
+        let post = || async {
+            let r = client.post(&url).body("{}").send().await?;
+            assert_eq!(r.version(), reqwest::Version::HTTP_2, "the test needs HTTP/2");
+            r.bytes().await.map(|_| ())
+        };
+        post().await.expect("first call");
+        for f in frozen.lock().unwrap().iter() {
+            f.store(true, Ordering::SeqCst);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let mut fails = 0;
+        loop {
+            if post().await.is_ok() {
+                break;
+            }
+            fails += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "calls still fail 6 s after the connection went silent ({fails} failures): the dead HTTP/2 connection is kept"
+            );
+        }
+    }
 
     #[test]
     fn preview_preserves_the_anchored_store_and_drops_untrusted_committee() {

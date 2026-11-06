@@ -24,7 +24,7 @@
 use crate::execution::ExecutionRpc;
 use crate::get_client;
 use crate::magi_prover::MagiZkProver;
-use crate::magi_submitter::{submit_call, MagiSubmitterConfig, SubmittedHeader};
+use crate::magi_submitter::{fetch_account_rc, submit_call, MagiSubmitterConfig, SubmittedHeader};
 use alloy::sol_types::SolType;
 use alloy_primitives::B256;
 use anyhow::{bail, ensure, Context, Result};
@@ -180,6 +180,24 @@ impl Budgets {
     }
 }
 
+/// I-30 (testnet 11-04): the daily budget ran out at 18:01 and the bridge had no
+/// proven tip until the oldest paid proof aged out (9 h 20 m), with nothing but
+/// the operator's own ERROR line once it was already spent. This is the early
+/// warning: once three quarters of `--max-proofs-per-day` is used in the
+/// rolling 24 h, say so (with how many are left), before a wanted proof has to
+/// wait. None below the threshold, at or past the cap (the A10 error covers
+/// that), or with no daily cap.
+pub fn budget_warning(paid_in_window: u64, per_day: Option<u64>) -> Option<String> {
+    let max = per_day?;
+    if max == 0 || paid_in_window >= max || paid_in_window * 4 < max * 3 {
+        return None;
+    }
+    Some(format!(
+        "A10: {paid_in_window} of {max} daily proofs used in the last 24 h ({} left); at {max} every wanted proof waits until the oldest paid proof is 24 h old: raise --max-proofs-per-day or slow the traffic",
+        max - paid_in_window
+    ))
+}
+
 /// A10: one PROVE in PROVE wei.
 const PROVE_WEI: u128 = 1_000_000_000_000_000_000;
 
@@ -272,6 +290,33 @@ pub fn proof_payload(proof: &[u8], public_values: &[u8], rlps: &[Vec<u8>]) -> St
         "headers": headers_json(rlps),
     })
     .to_string()
+}
+
+/// I-23: warn while the operator's RC covers fewer than this many submits.
+pub const RC_WARN_SUBMITS: u64 = 3;
+
+/// I-23 (testnet 11-04 07:57): what the operator's available RC means for its
+/// next proof. The node refuses a transaction whose rc_limit is above the
+/// sender's available RC, so below one submit's rc_limit a proof could be paid
+/// for (PROVE) and then not submitted; the operator retried the refused submit
+/// every minute while confirms and sweeps waited, and nothing but that error
+/// line said why. `Err` stops proving; `Ok(Some)` is a low-RC warning; an
+/// unknown RC (no record, or unreadable) does not stop it (the node still
+/// refuses an unaffordable submit, as before).
+pub fn rc_gate(available: Option<i64>, rc_limit: u64) -> std::result::Result<Option<String>, String> {
+    let Some(rc) = available else { return Ok(None) };
+    let rc = rc.max(0) as u64;
+    if rc < rc_limit {
+        return Err(format!(
+            "operator RC {rc} is below one submitProof's rc_limit {rc_limit}: not proving (no PROVE spent) until the operator's L2 identity holds it (fund it with HBD)"
+        ));
+    }
+    if rc < rc_limit.saturating_mul(RC_WARN_SUBMITS) {
+        return Ok(Some(format!(
+            "operator RC {rc} covers fewer than {RC_WARN_SUBMITS} submitProofs ({rc_limit} each): fund the operator's L2 identity"
+        )));
+    }
+    Ok(None)
 }
 
 /// What one step did.
@@ -412,6 +457,18 @@ impl MagiOperator {
     }
 
     async fn prove(&self, st: &VerifierState) -> Result<Step> {
+        // I-23: never pay for a proof this operator cannot submit.
+        match fetch_account_rc(&self.submitter.graphql_urls, &self.submitter.did).await {
+            Ok(rc) => match rc_gate(rc, self.submitter.rc_limit) {
+                Err(why) => {
+                    tracing::error!("I-23: {why}");
+                    return Ok(Step::Idle);
+                }
+                Ok(Some(low)) => warn!("I-23: {low}"),
+                Ok(None) => {}
+            },
+            Err(e) => warn!("I-23: cannot read the operator's RC, proving anyway: {e:#}"),
+        }
         let local = self.prover.lightclient_vkey();
         if !vkey_matches(st.program_vkey.as_deref(), &local) {
             bail!(
@@ -465,6 +522,19 @@ impl MagiOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i23_no_proof_without_the_rc_to_submit_it() {
+        // testnet 11-04 07:57: 60 TBD of RC drained by 10 proofs; rc_limit 8,000
+        let e = rc_gate(Some(7_999), 8_000).unwrap_err();
+        assert!(e.contains("7999") && e.contains("8000"), "{e}");
+        assert!(rc_gate(Some(-5), 8_000).is_err(), "a negative reading is no RC");
+        let w = rc_gate(Some(8_000), 8_000).unwrap().expect("one submit's worth warns");
+        assert!(w.contains("fewer than 3"), "{w}");
+        assert!(rc_gate(Some(23_999), 8_000).unwrap().is_some());
+        assert_eq!(rc_gate(Some(24_000), 8_000), Ok(None));
+        assert_eq!(rc_gate(None, 8_000), Ok(None), "no RC record does not stop proving");
+    }
 
     #[test]
     fn reads_the_trusted_committee_as_the_verifier_stores_it() {
@@ -521,6 +591,20 @@ mod tests {
         assert_eq!(backoff(m, 1000), Duration::from_secs(3600));
         assert_eq!(backoff(Duration::from_secs(10), 7), Duration::from_secs(640));
         assert_eq!(backoff(Duration::MAX, 3), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn i30_the_daily_budget_warns_at_three_quarters() {
+        assert_eq!(budget_warning(17, Some(24)), None, "under 3/4: quiet");
+        let w = budget_warning(18, Some(24)).expect("18 of 24 is 3/4");
+        assert!(w.contains("18 of 24") && w.contains("6 left"), "{w}");
+        assert!(budget_warning(23, Some(24)).is_some());
+        assert_eq!(budget_warning(24, Some(24)), None, "spent: the A10 error says it");
+        assert_eq!(budget_warning(30, Some(24)), None);
+        assert_eq!(budget_warning(5, None), None, "no daily cap");
+        assert_eq!(budget_warning(0, Some(0)), None);
+        assert!(budget_warning(3, Some(4)).is_some(), "small caps: 3 of 4");
+        assert_eq!(budget_warning(2, Some(4)), None);
     }
 
     #[test]
@@ -649,6 +733,8 @@ mod tests {
         none.save_request(&PendingRequest { request_id: B256::ZERO, head: 1, latest_block: 2, counted: false }).unwrap();
         assert_eq!(none.load_request().unwrap(), None);
         assert_eq!(NetworkLimits::default().max_price_per_pgu, 300_000_000, "0.3 PROVE per billion PGU");
+        // I-27: a stuck request blocks proving for the whole deadline
+        assert_eq!(NetworkLimits::default().proof_timeout, Duration::from_secs(600), "a 10 min deadline");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -37,6 +37,48 @@ fn magi_http_client() -> Result<reqwest::Client> {
         .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
+/// I-23 (testnet 11-04): the RC `account` has available on Magi
+/// (`getAccountRC.amount`), or `None` when the node keeps no RC record for it
+/// (an account that never sent a transaction). Tries each endpoint in turn.
+pub async fn fetch_account_rc(graphql_urls: &[String], account: &str) -> Result<Option<i64>> {
+    #[derive(Deserialize)]
+    struct Rc {
+        amount: i64,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(rename = "getAccountRC")]
+        rc: Option<Rc>,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<Data>,
+        errors: Option<Vec<serde_json::Value>>,
+    }
+    let client = magi_http_client()?;
+    let body = serde_json::json!({
+        "query": "query($a: String!){ getAccountRC(account: $a){ amount } }",
+        "variables": { "a": account },
+    });
+    let mut last = anyhow::anyhow!("no GraphQL URL configured");
+    for url in graphql_urls {
+        let resp = match client.post(url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last = anyhow::anyhow!("getAccountRC request failed: {e}");
+                continue;
+            }
+        };
+        match resp.json::<Resp>().await {
+            Ok(Resp { errors: Some(e), .. }) if !e.is_empty() => last = anyhow::anyhow!("getAccountRC: {:?}", e),
+            Ok(Resp { data: Some(d), .. }) => return Ok(d.rc.map(|r| r.amount)),
+            Ok(_) => last = anyhow::anyhow!("getAccountRC: empty response"),
+            Err(e) => last = anyhow::anyhow!("getAccountRC response was not valid JSON: {e}"),
+        }
+    }
+    Err(last)
+}
+
 /// Configuration for the Magi submitter.
 #[derive(Clone)]
 pub struct MagiSubmitterConfig {
