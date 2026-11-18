@@ -254,15 +254,27 @@ pub async fn submit_proof(
 /// Signs `action(payload_json)` on the verifier contract with the
 /// zk-tx-signer sidecar and submits it; returns the L2 tx id.
 pub async fn submit_call(config: &MagiSubmitterConfig, action: &str, payload_json: &str) -> Result<String> {
-    // Delegate to the Go sidecar for CBOR+EIP712 signing.
-    let tx_result = call_go_sidecar(config, action, payload_json).await?;
-
-    let graphql_url = config
-        .graphql_urls
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No GraphQL URL configured"))?;
-
-    submit_transaction(graphql_url, &tx_result.tx_b64, &tx_result.sig_b64).await
+    // OPER-GQL-FIRST-1 (audit 11-18): each configured endpoint in turn, the
+    // nonce read from the same endpoint the transaction goes to; only the first
+    // was used, so one node down stopped every submit. A resend after an
+    // endpoint that took the transaction but failed to answer carries the same
+    // nonce and payload, so it is the same transaction.
+    let mut last = anyhow::anyhow!("No GraphQL URL configured");
+    for graphql_url in &config.graphql_urls {
+        // Delegate to the Go sidecar for CBOR+EIP712 signing.
+        let tx_result = match call_go_sidecar(config, graphql_url, action, payload_json).await {
+            Ok(t) => t,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        match submit_transaction(graphql_url, &tx_result.tx_b64, &tx_result.sig_b64).await {
+            Ok(id) => return Ok(id),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 struct SignedTx {
@@ -279,14 +291,10 @@ struct SignedTx {
 /// Output: JSON {"tx_b64":"...","sig_b64":"..."}
 async fn call_go_sidecar(
     config: &MagiSubmitterConfig,
+    graphql_url: &str,
     action: &str,
     payload_json: &str,
 ) -> Result<SignedTx> {
-    let graphql_url = config
-        .graphql_urls
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No GraphQL URL configured"))?;
-
     let nonce = fetch_nonce(graphql_url, &config.did).await?;
 
     // review6 H4: pass the private key via env var instead of CLI argv.

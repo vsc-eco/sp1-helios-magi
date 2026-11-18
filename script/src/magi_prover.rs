@@ -106,10 +106,23 @@ pub async fn fetch_contract_state(
     contract_id: &str,
     keys: &[&str],
 ) -> Result<HashMap<String, Option<String>>> {
-    let graphql_url = graphql_urls
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no GraphQL URL configured"))?;
+    // OPER-GQL-FIRST-1 (audit 11-18): every configured endpoint is tried in
+    // turn; only the first was used, so one node down stopped all proving.
+    let mut last = anyhow::anyhow!("no GraphQL URL configured");
+    for graphql_url in graphql_urls {
+        match fetch_contract_state_at(graphql_url, contract_id, keys).await {
+            Ok(state) => return Ok(state),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
 
+async fn fetch_contract_state_at(
+    graphql_url: &str,
+    contract_id: &str,
+    keys: &[&str],
+) -> Result<HashMap<String, Option<String>>> {
     let client = reqwest::Client::builder()
         .connect_timeout(ELF_PIN_CONNECT_TIMEOUT)
         .timeout(ELF_PIN_REQUEST_TIMEOUT)
@@ -654,6 +667,38 @@ pub async fn prover_settings_from_env() -> Result<ProverSettings> {
 mod tests {
     use super::*;
     use alloy::sol_types::SolValue;
+
+    /// A one-request HTTP server answering `body` as JSON.
+    async fn one_shot_json(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/api/v1/graphql")
+    }
+
+    /// OPER-GQL-FIRST-1 (audit 11-18): a state read goes to the next endpoint
+    /// when the first is down; only the first was used before, so one node
+    /// down stopped all proving (and made the startup ELF-pin read fatal).
+    #[tokio::test]
+    async fn state_read_fails_over_to_the_next_endpoint() {
+        let down = "http://127.0.0.1:1/api/v1/graphql".to_string();
+        let up = one_shot_json(r#"{"data":{"getStateByKeys":{"elfh":"abcd"}}}"#).await;
+        let state = fetch_contract_state(&[down.clone(), up], "vsc1verifier", &["elfh"]).await.unwrap();
+        assert_eq!(state.get("elfh").cloned().flatten().as_deref(), Some("abcd"));
+        assert!(fetch_contract_state(&[down], "vsc1verifier", &["elfh"]).await.is_err());
+    }
 
     fn pv(prev: u64, new: u64, genesis: B256) -> Vec<u8> {
         pvc(prev, new, genesis, B256::repeat_byte(0xc0))
