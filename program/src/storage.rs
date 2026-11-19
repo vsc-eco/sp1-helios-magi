@@ -3,7 +3,7 @@ sp1_zkvm::entrypoint!(main);
 
 use alloy_primitives::B256;
 use alloy_sol_types::SolValue;
-use magi_zk_oracle_primitives::{
+use sp1_helios_primitives::{
     types::{ContractStorage, StorageProofOutputs},
     verify_storage_slot_proofs,
 };

@@ -13,6 +13,71 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Z-PR-M4 (MED #41): bound every GraphQL HTTP call made by this module.
+///
+/// `reqwest::Client::new()` builds a client with NO overall request timeout
+/// and NO connect timeout. A slow or hung Magi GraphQL endpoint would
+/// otherwise pin the calling tokio task forever (a slow-loris upstream
+/// stalls the whole proof-submission pipeline). Both a connect timeout and
+/// an overall request timeout are required: connect-only does not bound a
+/// peer that completes the TCP handshake then trickles bytes.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a reqwest client with bounded connect + overall request timeouts.
+/// Used for all Magi GraphQL calls in this module so no single hung endpoint
+/// can stall the submitter indefinitely.
+fn magi_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
+}
+
+/// I-23 (testnet 11-04): the RC `account` has available on Magi
+/// (`getAccountRC.amount`), or `None` when the node keeps no RC record for it
+/// (an account that never sent a transaction). Tries each endpoint in turn.
+pub async fn fetch_account_rc(graphql_urls: &[String], account: &str) -> Result<Option<i64>> {
+    #[derive(Deserialize)]
+    struct Rc {
+        amount: i64,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(rename = "getAccountRC")]
+        rc: Option<Rc>,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<Data>,
+        errors: Option<Vec<serde_json::Value>>,
+    }
+    let client = magi_http_client()?;
+    let body = serde_json::json!({
+        "query": "query($a: String!){ getAccountRC(account: $a){ amount } }",
+        "variables": { "a": account },
+    });
+    let mut last = anyhow::anyhow!("no GraphQL URL configured");
+    for url in graphql_urls {
+        let resp = match client.post(url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last = anyhow::anyhow!("getAccountRC request failed: {e}");
+                continue;
+            }
+        };
+        match resp.json::<Resp>().await {
+            Ok(Resp { errors: Some(e), .. }) if !e.is_empty() => last = anyhow::anyhow!("getAccountRC: {:?}", e),
+            Ok(Resp { data: Some(d), .. }) => return Ok(d.rc.map(|r| r.amount)),
+            Ok(_) => last = anyhow::anyhow!("getAccountRC: empty response"),
+            Err(e) => last = anyhow::anyhow!("getAccountRC response was not valid JSON: {e}"),
+        }
+    }
+    Err(last)
+}
 
 /// Configuration for the Magi submitter.
 #[derive(Clone)]
@@ -39,15 +104,12 @@ pub struct SubmitProofPayload {
     pub headers: Vec<SubmittedHeader>,
 }
 
+/// One header as the verifier reads it: the RLP alone (bare hex). Every
+/// stored field is parsed from it and bound by its keccak, so nothing else is
+/// sent; each extra byte costs header room under the 8192-byte payload cap.
 #[derive(Serialize)]
 pub struct SubmittedHeader {
     pub rlp_hex: String,
-    pub block_number: u64,
-    pub transactions_root: String,
-    pub receipts_root: String,
-    pub base_fee_per_gas: u64,
-    pub gas_limit: u64,
-    pub timestamp: u64,
 }
 
 /// GraphQL response from submitTransactionV1.
@@ -92,7 +154,7 @@ struct NonceResult {
 
 /// Fetch the account nonce from Magi GraphQL.
 pub async fn fetch_nonce(graphql_url: &str, did: &str) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = magi_http_client()?;
     let body = serde_json::json!({
         "query": "query($account: String!) { getAccountNonce(account: $account) { nonce } }",
         "variables": { "account": did }
@@ -106,16 +168,24 @@ pub async fn fetch_nonce(graphql_url: &str, did: &str) -> Result<u64> {
         .json()
         .await?;
 
-    Ok(resp
-        .data
+    // review6 closure (Z-PR-H2): fail loud when the GraphQL response does
+    // not contain a usable nonce. Pre-fix `.unwrap_or(0)` defaulted to
+    // nonce=0 on any parse/missing-field failure, causing the submitter
+    // to sign a tx the chain immediately rejects (or worse, collide with
+    // init). An explicit error gives the operator the right signal.
+    resp.data
         .and_then(|d| d.nonce_result)
         .map(|n| n.nonce)
-        .unwrap_or(0))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "fetch_nonce: GraphQL response missing getAccountNonce.nonce — refusing to default to 0"
+            )
+        })
 }
 
 /// Submit a signed transaction to Magi GraphQL.
 pub async fn submit_transaction(graphql_url: &str, tx_b64: &str, sig_b64: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = magi_http_client()?;
     let body = serde_json::json!({
         "query": "query($tx: String!, $sig: String!) { submitTransactionV1(tx: $tx, sig: $sig) { id } }",
         "variables": { "tx": tx_b64, "sig": sig_b64 }
@@ -143,6 +213,16 @@ pub async fn submit_transaction(graphql_url: &str, tx_b64: &str, sig_b64: &str) 
 
 /// Build and submit a proof to the Magi verifier contract.
 ///
+/// Z-PR-M5 (MED #42): this path is NOT a pure-Rust submitter. The CBOR +
+/// EIP-712 signing is delegated to the external `zk-tx-signer` Go binary
+/// (go-vsc-node/cmd/zk-tx-signer), invoked by `call_go_sidecar`. That binary
+/// MUST be present on PATH and the operator key is handed to it via the
+/// `ZK_TX_SIGNER_PRIVKEY` env var (NOT argv — review6 H4 / sidecar review2
+/// #122). Do NOT hand-roll a replacement signer: a bespoke shim that passes
+/// the key on the command line would re-open the Z-PR-H1 argv key-leak. The
+/// in-process Rust port of the signing path (steps 1-4 below) is the eventual
+/// goal; until it lands, this entry point depends on that external sidecar.
+///
 /// NOTE: This is a PLACEHOLDER. The full implementation requires:
 /// 1. CBOR encoding of VscContractCall (matching Go's SerializeVSC)
 /// 2. EIP-712 typed data hashing of the transaction container
@@ -168,16 +248,33 @@ pub async fn submit_proof(
         headers,
     };
     let payload_json = serde_json::to_string(&payload)?;
+    submit_call(config, "submitProof", &payload_json).await
+}
 
-    // For now: delegate to Go sidecar for CBOR+EIP712 signing
-    let tx_result = call_go_sidecar(config, "submitProof", &payload_json).await?;
-
-    let graphql_url = config
-        .graphql_urls
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No GraphQL URL configured"))?;
-
-    submit_transaction(graphql_url, &tx_result.tx_b64, &tx_result.sig_b64).await
+/// Signs `action(payload_json)` on the verifier contract with the
+/// zk-tx-signer sidecar and submits it; returns the L2 tx id.
+pub async fn submit_call(config: &MagiSubmitterConfig, action: &str, payload_json: &str) -> Result<String> {
+    // OPER-GQL-FIRST-1 (audit 11-18): each configured endpoint in turn, the
+    // nonce read from the same endpoint the transaction goes to; only the first
+    // was used, so one node down stopped every submit. A resend after an
+    // endpoint that took the transaction but failed to answer carries the same
+    // nonce and payload, so it is the same transaction.
+    let mut last = anyhow::anyhow!("No GraphQL URL configured");
+    for graphql_url in &config.graphql_urls {
+        // Delegate to the Go sidecar for CBOR+EIP712 signing.
+        let tx_result = match call_go_sidecar(config, graphql_url, action, payload_json).await {
+            Ok(t) => t,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        match submit_transaction(graphql_url, &tx_result.tx_b64, &tx_result.sig_b64).await {
+            Ok(id) => return Ok(id),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 struct SignedTx {
@@ -194,17 +291,21 @@ struct SignedTx {
 /// Output: JSON {"tx_b64":"...","sig_b64":"..."}
 async fn call_go_sidecar(
     config: &MagiSubmitterConfig,
+    graphql_url: &str,
     action: &str,
     payload_json: &str,
 ) -> Result<SignedTx> {
-    let graphql_url = config
-        .graphql_urls
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No GraphQL URL configured"))?;
-
     let nonce = fetch_nonce(graphql_url, &config.did).await?;
 
+    // review6 H4: pass the private key via env var instead of CLI argv.
+    // argv is world-readable via /proc/<pid>/cmdline and `ps aux`, exposing
+    // the operator key to any user/process on the box for the lifetime of
+    // the subprocess. Env vars are visible only to the parent's UID via
+    // /proc/<pid>/environ (mode 0400). zk-tx-signer already supports the
+    // ZK_TX_SIGNER_PRIVKEY env-var path via the review2 #122 fix; this
+    // closes the caller side that still pinned the legacy argv form.
     let output = tokio::process::Command::new("zk-tx-signer")
+        .env("ZK_TX_SIGNER_PRIVKEY", &config.private_key_hex)
         .args([
             &config.contract_id,
             action,
@@ -212,7 +313,8 @@ async fn call_go_sidecar(
             &config.net_id,
             &config.rc_limit.to_string(),
             &nonce.to_string(),
-            &config.private_key_hex,
+            // private key intentionally NOT on argv — read from
+            // ZK_TX_SIGNER_PRIVKEY in the signer.
         ])
         .output()
         .await?;
@@ -223,8 +325,28 @@ async fn call_go_sidecar(
     }
 
     let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(SignedTx {
-        tx_b64: result["tx_b64"].as_str().unwrap_or("").to_string(),
-        sig_b64: result["sig_b64"].as_str().unwrap_or("").to_string(),
-    })
+
+    // Z-PR-M5 (MED #42): fail loud when the sidecar response is missing or
+    // empty. The pre-fix `.unwrap_or("")` silently substituted an empty
+    // string for an absent/empty `tx_b64`/`sig_b64`, which would then be
+    // submitted to `submitTransactionV1` as a malformed transaction — a
+    // skeleton-path footgun that wastes a proof and produces a confusing
+    // chain-side rejection instead of a clear operator-facing error. Demand
+    // both fields be present and non-empty.
+    let tx_b64 = result["tx_b64"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("zk-tx-signer returned no/empty tx_b64 — refusing to submit an empty transaction")
+        })?
+        .to_string();
+    let sig_b64 = result["sig_b64"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("zk-tx-signer returned no/empty sig_b64 — refusing to submit an unsigned transaction")
+        })?
+        .to_string();
+
+    Ok(SignedTx { tx_b64, sig_b64 })
 }

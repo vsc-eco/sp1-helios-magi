@@ -17,6 +17,9 @@ pub struct ProofInputs {
     pub genesis_root: B256,
     pub forks: Forks,
     pub contract_storage: Vec<ContractStorage>,
+    /// Full execution header when the finalized light-client header commits only its hash.
+    #[serde(default)]
+    pub execution_header: Option<alloy_consensus::Header>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -38,6 +41,15 @@ pub struct StorageSlotWithProof {
 }
 
 sol! {
+    // Chain-binding (genesis + sync-committee anchoring) — see the
+    // zk-header-verifier plan. `genesisRoot` is the genesis_validators_root the
+    // sync-committee signatures were verified against in-circuit, committed here
+    // so the on-chain verifier can pin + check it. It sits at sol position 11
+    // (ABI slot 10, byte 352); `storageSlots` (dynamic) follows at slot 11.
+    // The Go decoder reads `genesisRoot` from pvBytes[352:384]. The earlier
+    // `chainId` field (slot 11) was REMOVED — chain identity is established by
+    // genesisRoot + the trusted sync committee, not a spoofable committed scalar;
+    // the verifier stamps its own configured chainId into stored headers.
     struct ProofOutputs {
         /// The previous beacon block header hash.
         bytes32 prevHeader;
@@ -59,6 +71,36 @@ sol! {
         bytes32 syncCommitteeHash;
         /// The sync committee hash of the next period.
         bytes32 nextSyncCommitteeHash;
+        /// The genesis_validators_root the sync-committee signatures were
+        /// verified against (chain identity). Pinned + checked on-chain.
+        bytes32 genesisRoot;
+        /// Attested storage slots for the given block.
+        StorageSlot[] storageSlots;
+    }
+
+    struct ExecutionHeaderProofOutputs {
+        /// The previous beacon block header hash.
+        bytes32 prevHeader;
+        /// The slot of the previous head.
+        uint256 prevHead;
+        /// The anchor sync committee hash which was used to verify the proof.
+        bytes32 prevSyncCommitteeHash;
+        /// The slot of the new head.
+        uint256 newHead;
+        /// The new beacon block header hash.
+        bytes32 newHeader;
+        /// The execution state root from the execution payload of the new beacon block.
+        bytes32 executionStateRoot;
+        /// The execution block number.
+        uint256 executionBlockNumber;
+        /// The execution block hash.
+        bytes32 executionBlockHash;
+        /// The execution receipts root.
+        bytes32 executionReceiptsRoot;
+        /// The sync committee hash of the current period.
+        bytes32 syncCommitteeHash;
+        /// The sync committee hash of the next period.
+        bytes32 nextSyncCommitteeHash;
         /// Attested storage slots for the given block.
         StorageSlot[] storageSlots;
     }
@@ -72,5 +114,50 @@ sol! {
         bytes32 key;
         bytes32 value;
         address contractAddress;
+    }
+
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract SP1Helios {
+        bytes32 public immutable GENESIS_VALIDATORS_ROOT;
+        uint256 public immutable GENESIS_TIME;
+        uint256 public immutable SECONDS_PER_SLOT;
+        uint256 public immutable SLOTS_PER_PERIOD;
+        uint32 public immutable SOURCE_CHAIN_ID;
+        uint256 public head;
+        /// @notice The latest execution block number the light client has a finalized execution state root for.
+        uint256 public executionBlockNumber;
+        mapping(uint256 => bytes32) public syncCommittees;
+        mapping(uint256 => bytes32) public executionStateRoots;
+        mapping(uint256 => bytes32) public headers;
+        mapping(uint256 => bytes32) public executionBlockHashes;
+        mapping(uint256 => bytes32) public executionReceiptsRoots;
+        bytes32 public lightClientVkey;
+        bytes32 public storageSlotVkey;
+        bytes32 public executionHeaderVkey;
+
+        address public verifier;
+
+        event HeadUpdate(uint256 indexed slot, bytes32 indexed root);
+        event SyncCommitteeUpdate(uint256 indexed period, bytes32 indexed root);
+
+        function update(
+            bytes calldata proof,
+            uint256 newHead,
+            bytes32 newHeader,
+            bytes32 executionStateRoot,
+            uint256 _executionBlockNumber,
+            bytes32 syncCommitteeHash,
+            bytes32 nextSyncCommitteeHash,
+            StorageSlot[] memory _storageSlots
+        ) external;
+
+        function updateExecutionHeader(
+            bytes calldata proof,
+            ExecutionHeaderProofOutputs calldata po
+        ) external;
+
+        function getSyncCommitteePeriod(uint256 slot) internal view returns (uint256);
+        function getCurrentEpoch() internal view returns (uint256);
     }
 }

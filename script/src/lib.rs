@@ -1,8 +1,6 @@
 use alloy_primitives::B256;
 use helios_consensus_core::{
-    calc_sync_period,
-    consensus_spec::MainnetConsensusSpec,
-    types::{BeaconBlock, Update},
+    calc_sync_period, consensus_spec::MainnetConsensusSpec, types::Update,
 };
 use helios_ethereum::rpc::ConsensusRpc;
 use helios_ethereum::{
@@ -14,27 +12,48 @@ use helios_ethereum::{
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::sync::{mpsc::channel, watch};
-use tree_hash::TreeHash;
 
+pub mod execution;
+pub mod handle;
+pub mod magi_operator;
+pub mod magi_prover;
 pub mod magi_submitter;
 pub mod operator;
 
 pub const MAX_REQUEST_LIGHT_CLIENT_UPDATES: u8 = 128;
 
-/// Fetch updates for client
+/// Fetch updates for client.
+///
+/// review6 closure (Z-PR-H3): propagate the RPC error via Result instead
+/// of `.unwrap()`-panicking. The prior panic killed the entire submitter
+/// process on any transient consensus-RPC hiccup. Callers can now retry
+/// at their own cadence.
 pub async fn get_updates(
     client: &Inner<MainnetConsensusSpec, HttpRpc>,
-) -> Vec<Update<MainnetConsensusSpec>> {
+) -> Result<Vec<Update<MainnetConsensusSpec>>> {
     let period =
         calc_sync_period::<MainnetConsensusSpec>(client.store.finalized_header.beacon().slot);
 
-    let updates = client
+    let mut updates = client
         .rpc
         .get_updates(period, MAX_REQUEST_LIGHT_CLIENT_UPDATES)
         .await
-        .unwrap();
+        .map_err(|e| anyhow!("error fetching committee updates: {e}"))?;
 
-    updates.clone()
+    updates.retain(|update| {
+        let signature_period = calc_sync_period::<MainnetConsensusSpec>(*update.signature_slot());
+        update_period_in_requested_window(
+            signature_period,
+            period,
+            MAX_REQUEST_LIGHT_CLIENT_UPDATES,
+        )
+    });
+    updates.sort_by_key(|update| *update.signature_slot());
+    Ok(updates)
+}
+
+fn update_period_in_requested_window(signature_period: u64, start_period: u64, count: u8) -> bool {
+    signature_period >= start_period && signature_period < start_period + u64::from(count)
 }
 
 /// Fetch latest checkpoint from chain to bootstrap client to the latest state.
@@ -44,9 +63,12 @@ pub async fn get_latest_checkpoint(chain_id: u64) -> Result<B256> {
         .await
         .map_err(|e| anyhow!("error building checkpoint fallback: {}", e.to_string()))?;
 
-    let network = Network::from_chain_id(chain_id).unwrap_or_else(|_| {
-        panic!("unknown network: {chain_id}");
-    });
+    // review6 closure (Z-PR-L4): convert the panic on unknown chain_id
+    // into a typed error so a misconfigured submitter doesn't crash —
+    // instead it returns a clear "unknown network" error the operator
+    // can map to a config fix.
+    let network = Network::from_chain_id(chain_id)
+        .map_err(|_| anyhow!("get_latest_checkpoint: unknown network chain_id={}", chain_id))?;
 
     cf.fetch_latest_checkpoint(&network)
         .await
@@ -61,7 +83,10 @@ pub async fn get_client(
     consensus_rpc: &str,
     chain_id: u64,
 ) -> Result<Inner<MainnetConsensusSpec, HttpRpc>> {
-    let network = Network::from_chain_id(chain_id).unwrap();
+    // review6 closure (Z-PR-H3): convert `.unwrap()` panic into a typed
+    // error. Same rationale as get_latest_checkpoint above.
+    let network = Network::from_chain_id(chain_id)
+        .map_err(|_| anyhow!("get_client: unknown network chain_id={}", chain_id))?;
     let base_config = network.to_base_config();
 
     let config = Config {
@@ -86,15 +111,7 @@ pub async fn get_client(
     );
 
     let root = match slot {
-        Some(slot) => {
-            let block: BeaconBlock<MainnetConsensusSpec> = client
-                .rpc
-                .get_block(slot)
-                .await
-                .map_err(|e| anyhow!("error getting block: {}", e.to_string()))?;
-
-            block.tree_hash_root()
-        }
+        Some(slot) => get_checkpoint_root(consensus_rpc, slot).await?,
         None => get_latest_checkpoint(chain_id).await?,
     };
 
@@ -104,4 +121,41 @@ pub async fn get_client(
         .map_err(|e| anyhow!("error bootstrapping client: {}", e.to_string()))?;
 
     Ok(client)
+}
+
+/// Fetch a beacon block root without decoding fork-specific block bodies.
+pub async fn get_checkpoint_root(consensus_rpc: &str, slot: u64) -> Result<B256> {
+    let response: serde_json::Value = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(format!(
+            "{}/eth/v1/beacon/blocks/{slot}/root",
+            consensus_rpc.trim_end_matches('/')
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let root = response["data"]["root"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Beacon API response has no block root"))?;
+    Ok(root.parse()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_period_in_requested_window;
+
+    #[test]
+    fn accepts_requested_update_window() {
+        assert!(update_period_in_requested_window(1289, 1289, 128));
+        assert!(update_period_in_requested_window(1416, 1289, 128));
+    }
+
+    #[test]
+    fn rejects_out_of_window_update_periods() {
+        assert!(!update_period_in_requested_window(1288, 1289, 128));
+        assert!(!update_period_in_requested_window(1417, 1289, 128));
+    }
 }

@@ -6,7 +6,8 @@ use alloy_sol_types::SolValue;
 use helios_consensus_core::{
     apply_finality_update, apply_update, verify_finality_update, verify_update,
 };
-use magi_zk_oracle_primitives::{
+use sp1_helios_primitives::{
+    execution::verified_execution_fields,
     types::{ProofInputs, ProofOutputs},
     verify_storage_slot_proofs,
 };
@@ -32,7 +33,27 @@ pub fn main() {
         genesis_root,
         forks,
         contract_storage,
+        execution_header,
     } = serde_cbor::from_slice(&encoded_inputs).unwrap();
+
+    // SECURITY: the entire `store` is deserialized from prover-controlled input, so any field that
+    // is not re-derived from verified data inside this program must not be trusted. Unlike
+    // `current_sync_committee` (which the contract anchors on-chain via `prevSyncCommitteeHash`),
+    // `next_sync_committee` has no on-chain anchor. If we trusted the supplied value, a malicious
+    // prover could:
+    //   1. commit an arbitrary `nextSyncCommitteeHash` — e.g. with `updates` empty the loop below
+    //      never runs, so nothing constrains it — which the contract then stores as the canonical
+    //      committee for the next period; and
+    //   2. have `verify_update` check an update's signature against this attacker-chosen committee
+    //      (helios verifies updates whose signature period is `store_period + 1` against
+    //      `store.next_sync_committee`), enabling outright beacon-header / execution-state-root
+    //      forgery in a single proof.
+    // A legitimate `next_sync_committee` is only ever produced by `apply_update` after
+    // `verify_update` validates the update's `next_sync_committee` against its Merkle branch (rooted
+    // in a header signed by the trusted current committee). A fresh helios bootstrap also always
+    // starts with `next_sync_committee = None` (see `apply_bootstrap`), so resetting it here is a
+    // no-op for honest provers and the only safe starting point.
+    store.next_sync_committee = None;
 
     // Get the initial sync committee hash. When verifying the proof, this is secured by the
     // `prevSyncCommitteeHash` field in the `ProofOutputs` struct.
@@ -75,35 +96,47 @@ pub fn main() {
     // 3. Commit new state root, header, and sync committee.
     let header: B256 = store.finalized_header.beacon().tree_hash_root();
     let sync_committee_hash: B256 = store.current_sync_committee.tree_hash_root();
+    // MED Z-PR-M1 (Nomad-pattern landmine): when there is no next sync
+    // committee yet, do NOT emit B256::ZERO. A downstream consumer that compares
+    // this committed field against its own uninitialized (zero) storage would
+    // treat `ZERO == ZERO` as a valid match and silently bypass the sync-committee
+    // rotation guard. Emit an unambiguous non-zero sentinel instead: all-ones can
+    // never collide with zero-initialized storage, and the probability that a real
+    // SSZ `tree_hash_root` equals 0xFF..FF is cryptographically negligible, so a
+    // consumer can reliably distinguish "no next committee" from any real hash.
+    const NO_NEXT_SYNC_COMMITTEE: B256 = B256::repeat_byte(0xFF);
     let next_sync_committee_hash: B256 = match &mut store.next_sync_committee {
         Some(next_sync_committee) => next_sync_committee.tree_hash_root(),
-        None => B256::ZERO,
+        None => NO_NEXT_SYNC_COMMITTEE,
     };
     let head = store.finalized_header.beacon().slot;
-    let execution = store
-        .finalized_header
-        .execution()
-        .expect("Execution payload doesn't exist.");
+    let execution = verified_execution_fields(&store.finalized_header, execution_header.as_ref())
+        .expect("Execution header failed to verify.");
 
     let storage_slots = contract_storage
         .iter()
         .flat_map(|contract_storage| {
-            verify_storage_slot_proofs(*execution.state_root(), contract_storage)
+            verify_storage_slot_proofs(execution.state_root, contract_storage)
                 .expect("Storage slot proofs failed to verify.")
         })
         .collect();
 
     let proof_outputs = ProofOutputs {
-        executionStateRoot: *execution.state_root(),
-        executionBlockHash: *execution.block_hash(),
+        executionStateRoot: execution.state_root,
+        executionBlockHash: execution.block_hash,
         newHeader: header,
-        executionBlockNumber: U256::from(*execution.block_number()),
+        executionBlockNumber: U256::from(execution.block_number),
         nextSyncCommitteeHash: next_sync_committee_hash,
         newHead: U256::from(head),
         prevHeader: prev_header,
         prevHead: U256::from(prev_head),
         syncCommitteeHash: sync_committee_hash,
         prevSyncCommitteeHash: prev_sync_committee_hash,
+        // Chain identity: the same genesis_validators_root used above in
+        // verify_update / verify_finality_update for the BLS signing domain,
+        // committed so the on-chain verifier can pin + check it (ABI slot 10,
+        // pvBytes[352:384]).
+        genesisRoot: genesis_root,
         storageSlots: storage_slots,
     };
 

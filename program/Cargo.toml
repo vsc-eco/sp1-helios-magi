@@ -1,6 +1,6 @@
 [package]
-version = "0.1.0"
-name = "magi-zk-oracle-program"
+version.workspace = true
+name = "sp1-helios-program"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -10,14 +10,18 @@ name = "light_client"
 path = "src/light_client.rs"
 
 [[bin]]
+name = "execution_header"
+path = "src/execution_header.rs"
+
+[[bin]]
 name = "storage"
 path = "src/storage.rs"
 
 [dependencies]
-sp1-zkvm = "6.1.0"
+sp1-zkvm = "=6.8.1"
 helios-consensus-core = { workspace = true }
 serde_cbor = { workspace = true }
-magi-zk-oracle-primitives = { workspace = true }
+sp1-helios-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
 alloy-primitives = { workspace = true, features = ["sha3-keccak"] }
 tree_hash = { workspace = true }
